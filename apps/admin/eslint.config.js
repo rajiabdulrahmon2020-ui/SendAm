@@ -17,10 +17,22 @@ export default defineConfig([
       globals: globals.browser,
       parserOptions: { ecmaFeatures: { jsx: true } },
     },
+    rules: {
+      // adminApi.js strips cursor/limit keys via rest destructuring
+      // (`const { after, before, limit, ...filters } = params`); the stripped
+      // siblings are intentionally never read.
+      'no-unused-vars': ['error', { ignoreRestSiblings: true }],
+    },
   },
   {
     // Vite config runs in Node, so it needs Node globals (e.g. __dirname).
     files: ['vite.config.js'],
     languageOptions: { globals: globals.node },
+  },
+  {
+    // Tests and test setup run under Vitest/jsdom (browser globals) but also
+    // touch Node globals directly (e.g. `global.ResizeObserver`).
+    files: ['**/*.test.{js,jsx}', 'src/setupTests.js', 'src/test/**/*.{js,jsx}'],
+    languageOptions: { globals: { ...globals.browser, ...globals.node } },
   },
 ])

@@ -62,7 +62,13 @@ const prismaMock = {
     count: async () => 0,
     findMany: async () => [],
   },
-  alias: { findUnique: async () => null, findFirst: async () => ({ id: 'alias_1' }) },
+  wallet: {
+    findUnique: async () => null,
+    create: async ({ data }) => ({ publicKey: 'G' + 'A'.repeat(55), ...data }),
+    update: async ({ where, data }) => ({ id: where.id, ...data }),
+    findMany: async () => [],
+  },
+  alias: { findUnique: async () => null },
   processedMessage: {
     _seen: new Set(),
     _status: new Map(),
@@ -93,7 +99,6 @@ const prismaMock = {
     upsert: async ({ create }) => ({ ...create, resetAt: new Date(Date.now() + 60_000) }),
   },
   transaction: { findMany: async () => [], findFirst: async () => null },
-  wallet: { findUnique: async () => null, create: async ({ data }) => ({ publicKey: 'G' + 'A'.repeat(55), ...data }) },
   kycProfile: {
     findUnique: async ({ where }) => {
       if (where.userId) return { id: 'kyc_1', userId: where.userId, tier: 1, status: 'approved', riskScore: 10 };

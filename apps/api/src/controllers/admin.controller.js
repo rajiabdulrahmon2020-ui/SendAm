@@ -1,14 +1,24 @@
 const { sendSuccess, sendError, sendCursorPaginated } = require('../utils/response');
-const { authenticate, createInvitation, acceptInvitation, revokeSessions, hashPassword } = require('../services/adminAuth.service');
+const { authenticate, createInvitation, acceptInvitation, revokeSessions, hashPassword, changeOwnPassword } = require('../services/adminAuth.service');
 const { writeAuditLog } = require('../common/audit.service');
+const { queryEvents, verifyEventChain: verifyEventChainService } = require('../common/event.service');
+const { deactivateAccount, reactivateAccount, getAccountStatusHistory, DEACTIVATION_REASONS } = require('../compliance/account.service');
+const { getOnboardingStatus } = require('../compliance/onboarding.service');
+const { buildUserEvidencePackage, exportWorkflowEventsCsv, exportKycEvidenceCsv, exportAccountStatusHistoryCsv } = require('../compliance/evidence.service');
 const prisma = require('../common/prisma');
 const { withIdAliases } = require('../common/records');
 const { parseLimit, cursorQuery, MAX_EXPORT_ROWS } = require('../utils/cursorPagination');
+const { listStuckPayments, operatorResolveStuckPayment, listLedgerDiscrepancies } = require('../payment/payment.reconciler');
+const { getWalletActivitySummary } = require('../services/wallet-activity-summary.service');
+const walletService = require('../wallet/wallet.service');
+const { getRotationStatus, rotateSecret: performSecretRotation, SECRET_CATEGORIES } = require('../services/secret-rotation.service');
+const { getExchangeRate } = require('../pricing/pricing.service');
+const { getAssetRule } = require('../utils/money');
 
 // Build an inclusive [gte, lte] range from `from`/`to` query params. Tolerant of
 // bare dates ("2024-01-01") and full ISO timestamps; invalid input is ignored
 // so a bad filter never returns a hard error.
-const parseDateRange = (query, field = 'createdAt') => {
+const  parseDateRange = (query, field = 'createdAt') => {
   const { from, to, [field]: fieldRange } = query;
   const start = from || (fieldRange ? fieldRange.split(',')[0] : null);
   const end = to || (fieldRange ? fieldRange.split(',')[1] : null);
@@ -80,6 +90,7 @@ const auditWhere = (query) => {
   const where = {};
   if (query.action) where.action = { equals: query.action };
   if (query.actorType) where.actorType = { equals: query.actorType };
+  if (query.actorId) where.actorId = { equals: query.actorId };
   if (query.entityType) where.entityType = { equals: query.entityType };
   Object.assign(where, parseDateRange(query, 'createdAt'));
   Object.assign(where, identifierWhere(query.identifier, ['id', 'entityId']));
@@ -109,7 +120,7 @@ const login = async (req, res, next) => {
       return sendError(res, 'Invalid credentials', 401);
     }
     await writeAuditLog({ actorType: 'administrator', actorId: result.admin.id, action: 'admin.login.succeeded', entityType: 'AdminSession', entityId: result.session.id, req });
-    return sendSuccess(res, { token: result.token, administrator: { id: result.admin.id, email: result.admin.email, name: result.admin.name, role: result.admin.role.name } }, 'Login successful');
+    return sendSuccess(res, { token: result.token, mustChangePassword: result.mustChangePassword === true, administrator: { id: result.admin.id, email: result.admin.email, name: result.admin.name, role: result.admin.role.name } }, 'Login successful');
   } catch (error) {
     next(error);
   }
@@ -188,6 +199,88 @@ const logout = async (req, res, next) => {
   } catch (error) { return next(error); }
 };
 
+// Allows an operator to rotate to a private password (or change it later), the
+// required first step after a bootstrap/temporary credential. All other active
+// sessions are revoked so a leaked shared token cannot continue to act, and the
+// change itself is attributed to the operator.
+const changePassword = async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    const admin = await changeOwnPassword({
+      adminId: req.admin.id,
+      currentPassword,
+      newPassword,
+      sessionId: req.admin.sessionId,
+    });
+    await writeAuditLog({ actorType: 'administrator', actorId: admin.id, action: 'admin.password.changed', entityType: 'AdminUser', entityId: admin.id, req });
+    return sendSuccess(res, null, 'Password changed');
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode, { code: 'PASSWORD_CHANGE_FAILED' });
+    return next(error);
+  }
+};
+
+const me = async (req, res, next) => {
+  try {
+    return sendSuccess(res, {
+      id: req.admin.id,
+      email: req.admin.email,
+      name: req.admin.name,
+      role: req.admin.role,
+      permissions: req.admin.permissions,
+      mustChangePassword: req.admin.mustChangePassword === true,
+    });
+  } catch (error) { return next(error); }
+};
+
+// Unified balance/valuation summary. Totals settled volume per asset, plus a
+// best-effort conversion to a single base currency so operators can compare
+// wallets holding different assets. Each row carries the FX source and
+// precision so a stale or unavailable rate is visible rather than silently
+// wrong. `baseAmount` stays null when no rate can be sourced.
+const BALANCE_SUMMARY_BASE_CURRENCY = 'USD';
+
+const getBalanceSummary = async () => {
+  const rows = await prisma.$queryRaw`
+    SELECT "asset", SUM("amount"::numeric)::text AS total
+    FROM "Transaction"
+    WHERE "status" = 'success'
+    GROUP BY "asset"
+  `;
+
+  return Promise.all(rows.map(async ({ asset, total }) => {
+    let rule;
+    try {
+      rule = getAssetRule(asset);
+    } catch {
+      return { asset, amount: total, precision: null, baseCurrency: BALANCE_SUMMARY_BASE_CURRENCY, baseAmount: null, rate: null, source: 'unsupported_asset' };
+    }
+
+    const amount = Number(total).toFixed(rule.precision);
+    if (asset === BALANCE_SUMMARY_BASE_CURRENCY) {
+      return { asset, amount, precision: rule.precision, baseCurrency: BALANCE_SUMMARY_BASE_CURRENCY, baseAmount: amount, rate: '1', source: 'identity' };
+    }
+
+    let rate = null;
+    try {
+      rate = await getExchangeRate({ sourceCurrency: asset, targetCurrency: BALANCE_SUMMARY_BASE_CURRENCY });
+    } catch {
+      rate = null;
+    }
+    const baseAmount = rate != null ? (Number(amount) * Number(rate)).toFixed(getAssetRule(BALANCE_SUMMARY_BASE_CURRENCY).precision) : null;
+
+    return {
+      asset,
+      amount,
+      precision: rule.precision,
+      baseCurrency: BALANCE_SUMMARY_BASE_CURRENCY,
+      baseAmount,
+      rate,
+      source: rate != null ? 'exchangerate-api' : 'unavailable',
+    };
+  }));
+};
+
 const getStats = async (req, res, next) => {
   try {
     const [
@@ -199,6 +292,7 @@ const getStats = async (req, res, next) => {
       pendingTransactions,
       pendingKyc,
       voiceCommands,
+      balances,
     ] = await Promise.all([
       prisma.user.count(),
       prisma.wallet.count(),
@@ -208,6 +302,7 @@ const getStats = async (req, res, next) => {
       prisma.transaction.count({ where: { status: { in: ['pending', 'processing'] } } }),
       prisma.kycProfile.count({ where: { status: { in: ['pending', 'review'] } } }),
       prisma.voiceCommand.count(),
+      getBalanceSummary(),
     ]);
 
     sendSuccess(res, {
@@ -219,6 +314,7 @@ const getStats = async (req, res, next) => {
       pendingTransactions,
       pendingKyc,
       voiceCommands,
+      balances,
     });
   } catch (error) {
     next(error);
@@ -267,6 +363,20 @@ const getWallets = async (req, res, next) => {
     const items = withIdAliases(result.items.map((wallet) => ({ ...wallet, encryptedSecretKey: undefined, userId: wallet.user })));
     sendCursorPaginated(res, items, { limit, nextCursor: result.nextCursor, prevCursor: result.prevCursor, total });
   } catch (error) { return next(error); }
+};
+
+const getTransaction = async (req, res, next) => {
+  try {
+    const tx = await prisma.transaction.findUnique({
+      where: { id: req.params.id },
+      include: { user: { select: { phoneNumber: true } } },
+    });
+    if (!tx) return sendError(res, 'Transaction not found', 404);
+    const item = withIdAliases([{ ...tx, userId: tx.user }])[0];
+    return sendSuccess(res, item);
+  } catch (error) {
+    next(error);
+  }
 };
 
 const getTransactions = async (req, res, next) => {
@@ -334,6 +444,45 @@ const getAuditLogs = async (req, res, next) => {
   } catch (error) { return next(error); }
 };
 
+const exportTransactions = async (req, res, next) => {
+  try {
+    const where = transactionWhere(req.query);
+    const transactions = await prisma.transaction.findMany({
+      where,
+      include: { user: { select: { phoneNumber: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: MAX_EXPORT_ROWS,
+    });
+    await writeAuditLog({
+      actorType: 'administrator',
+      actorId: req.admin.id,
+      action: 'admin.transactions.export',
+      entityType: 'Transaction',
+      metadata: { filters: req.query, rows: transactions.length, capped: transactions.length >= MAX_EXPORT_ROWS },
+      req,
+    });
+    const csv = toCsv(
+      transactions.map((t) => ({ ...t, phoneNumber: t.user?.phoneNumber })),
+      [
+        { header: 'id', accessor: 'id' },
+        { header: 'type', accessor: 'type' },
+        { header: 'amount', accessor: 'amount' },
+        { header: 'asset', accessor: 'asset' },
+        { header: 'rail', accessor: 'rail' },
+        { header: 'status', accessor: 'status' },
+        { header: 'destination', accessor: 'destination' },
+        { header: 'recipientPhoneNumber', accessor: 'recipientPhoneNumber' },
+        { header: 'txHash', accessor: 'txHash' },
+        { header: 'phoneNumber', accessor: 'phoneNumber' },
+        { header: 'createdAt', accessor: (r) => r.createdAt?.toISOString?.() || r.createdAt },
+      ]
+    );
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="transactions-export.csv"');
+    return res.status(200).send(csv);
+  } catch (error) { return next(error); }
+};
+
 // Sensitive exports: authorized (route-level requireAdmin), bounded so a single
 // request can never dump the whole table, and always recorded to the audit log.
 const exportKyc = async (req, res, next) => {
@@ -370,6 +519,49 @@ const exportKyc = async (req, res, next) => {
     res.setHeader('Content-Disposition', 'attachment; filename="kyc-export.csv"');
     return res.status(200).send(csv);
   } catch (error) { return next(error); }
+};
+
+// Full identifiers are available only through an explicit, permission-gated,
+// single-record action. The response expires quickly and every reveal is
+// recorded. Secrets and raw provider metadata are never revealable.
+const revealSensitiveFields = async (req, res, next) => {
+  try {
+    const { resource, id } = req.params;
+    const queries = {
+      user: () => prisma.user.findUnique({ where: { id }, select: { phoneNumber: true, whatsappName: true } }),
+      wallet: () => prisma.wallet.findUnique({ where: { id }, select: { publicKey: true, phoneNumber: true } }),
+      transaction: () => prisma.transaction.findUnique({
+        where: { id },
+        select: { destination: true, recipientPhoneNumber: true, txHash: true, providerTransactionId: true },
+      }),
+      kyc: () => prisma.kycProfile.findUnique({
+        where: { id },
+        select: { providerReference: true, deniedReason: true },
+      }),
+    };
+    if (!queries[resource]) return sendError(res, 'Unsupported reveal resource', 400);
+    const fields = await queries[resource]();
+    if (!fields) return sendError(res, 'Record not found', 404);
+
+    await writeAuditLog({
+      actorType: 'admin',
+      actorId: req.admin?.role,
+      action: 'admin.sensitive.revealed',
+      entityType: resource,
+      entityId: id,
+      metadata: { fields: Object.keys(fields) },
+      req,
+    });
+
+    return sendSuccess(res, {
+      resource,
+      id,
+      fields,
+      validUntil: new Date(Date.now() + 60_000).toISOString(),
+    }, 'Sensitive fields revealed for this response only');
+  } catch (error) {
+    next(error);
+  }
 };
 
 const exportAuditLogs = async (req, res, next) => {
@@ -439,12 +631,101 @@ const refundTransaction = async (req, res, next) => {
     next(error);
   }
 };
+const getStuckPayments = async (req, res, next) => {
+  try {
+    const staleAgeMs = req.query.staleAgeMs ? Number(req.query.staleAgeMs) : undefined;
+    const maxTransactions = req.query.limit ? parseLimit(req.query.limit) : undefined;
+    const payments = await listStuckPayments({ prisma, staleAgeMs, maxTransactions });
+    return sendSuccess(res, payments);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const actOnStuckPayment = (action) => async (req, res, next) => {
+  try {
+    const transaction = await operatorResolveStuckPayment({
+      prisma,
+      transactionId: req.params.id,
+      action,
+      reason: req.body?.reason,
+      adminId: req.admin?.id || 'system',
+    });
+    return sendSuccess(res, { transaction }, 'Stuck payment updated');
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getLedgerDiscrepancies = async (req, res, next) => {
+  try {
+    const report = await listLedgerDiscrepancies({ prisma, maxEntries: req.query.limit ? parseLimit(req.query.limit) : undefined });
+    return sendSuccess(res, report);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getWalletSummary = async (req, res, next) => {
+  try {
+    const summary = await getWalletActivitySummary({
+      userId: req.query.userId,
+      phoneNumber: req.query.phone,
+      windowDays: req.query.windowDays,
+      requestingAdminId: req.admin?.id || 'system',
+    });
+    return sendSuccess(res, summary);
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    return next(error);
+  }
+};
+
+const recoverWallet = async (req, res, next) => {
+  try {
+    const result = await walletService.recoverWallet({
+      walletId: req.params.id,
+      adminId: req.admin?.id || 'system',
+    });
+    return sendSuccess(res, { wallet: result }, 'Wallet recovery initiated');
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    return next(error);
+  }
+};
+
+const getSecretRotationStatus = async (req, res, next) => {
+  try {
+    const status = await getRotationStatus();
+    return sendSuccess(res, status);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const rotateSecret = async (req, res, next) => {
+  try {
+    const category = req.body?.category;
+    if (!category || !SECRET_CATEGORIES[category]) {
+      return sendError(res, `Invalid secret category. Supported: ${Object.keys(SECRET_CATEGORIES).join(', ')}`, 400);
+    }
+    const result = await performSecretRotation({
+      category,
+      newValue: req.body?.newValue,
+      rotatedBy: req.admin?.id || 'system',
+    });
+    return sendSuccess(res, result, 'Secret rotation completed', 201);
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    return next(error);
+  }
+};
 
 const verifyAuditLogs = async (req, res, next) => {
   try {
     const { verifyAuditLogIntegrity } = require('../common/audit.service');
     const result = await verifyAuditLogIntegrity();
-    
+
     await writeAuditLog({
       actorType: 'administrator',
       actorId: req.admin.id,
@@ -464,10 +745,356 @@ const verifyAuditLogs = async (req, res, next) => {
   }
 };
 
+// ── Issue #318: Workflow event ledger ────────────────────────────────────────
+
+const getWorkflowEvents = async (req, res, next) => {
+  try {
+    const limit = parseLimit(req.query.limit);
+    const result = await queryEvents({
+      eventType: req.query.eventType,
+      actorType: req.query.actorType,
+      actorId: req.query.actorId,
+      aggregateType: req.query.aggregateType,
+      from: req.query.from,
+      to: req.query.to,
+      limit,
+      after: req.query.after,
+    });
+    return sendSuccess(res, { items: result.items, nextCursor: result.nextCursor });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const verifyEventChain = async (req, res, next) => {
+  try {
+    const result = await verifyEventChainService();
+    await writeAuditLog({
+      actorType: 'administrator',
+      actorId: req.admin.id,
+      action: 'admin.events.verify',
+      entityType: 'WorkflowEvent',
+      metadata: { valid: result.valid, errorCount: result.errors.length, total: result.total },
+      req,
+    });
+    if (!result.valid) {
+      return sendError(res, 'Event chain integrity verification failed', 409, { errors: result.errors });
+    }
+    return sendSuccess(res, { valid: true, total: result.total }, 'Event chain verified successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+const exportWorkflowEvents = async (req, res, next) => {
+  try {
+    const csv = await exportWorkflowEventsCsv({
+      filters: req.query,
+      actingAdminId: req.admin.id,
+      req,
+    });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="workflow-events-export.csv"');
+    return res.status(200).send(csv);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── Issue #329: Compliance evidence exports ──────────────────────────────────
+
+const getUserEvidencePackage = async (req, res, next) => {
+  try {
+    const pkg = await buildUserEvidencePackage({
+      userId: req.params.userId,
+      actingAdminId: req.admin.id,
+      req,
+    });
+    return sendSuccess(res, pkg);
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    next(error);
+  }
+};
+
+const downloadUserEvidencePackage = async (req, res, next) => {
+  try {
+    const pkg = await buildUserEvidencePackage({
+      userId: req.params.userId,
+      actingAdminId: req.admin.id,
+      req,
+    });
+    const filename = `evidence-${req.params.userId}-${Date.now()}.json`;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.status(200).send(JSON.stringify(pkg, null, 2));
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    next(error);
+  }
+};
+
+const exportKycEvidence = async (req, res, next) => {
+  try {
+    const csv = await exportKycEvidenceCsv({
+      filters: req.query,
+      actingAdminId: req.admin.id,
+      req,
+    });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="kyc-evidence-export.csv"');
+    return res.status(200).send(csv);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const exportAccountStatusHistory = async (req, res, next) => {
+  try {
+    const csv = await exportAccountStatusHistoryCsv({
+      filters: req.query,
+      actingAdminId: req.admin.id,
+      req,
+    });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="account-status-export.csv"');
+    return res.status(200).send(csv);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── Issue #330: Onboarding status (admin view) ───────────────────────────────
+
+const getUserOnboardingStatus = async (req, res, next) => {
+  try {
+    const status = await getOnboardingStatus(req.params.userId);
+    return sendSuccess(res, status);
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    next(error);
+  }
+};
+
+// ── Issue #332: Account deactivation / reactivation ─────────────────────────
+
+const deactivateUserAccount = async (req, res, next) => {
+  try {
+    const { reason, notes, force } = req.body || {};
+
+    if (!reason) {
+      return sendError(
+        res,
+        `Deactivation reason is required. Valid reasons: ${[...Object.values(DEACTIVATION_REASONS)].join(', ')}`,
+        400,
+      );
+    }
+
+    const { user, record } = await deactivateAccount({
+      userId: req.params.userId,
+      reason,
+      notes,
+      adminId: req.admin.id,
+      force: Boolean(force),
+      req,
+    });
+
+    return sendSuccess(
+      res,
+      { userId: user.id, deactivatedAt: user.deactivatedAt, reason, recordId: record.id },
+      'Account deactivated',
+    );
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    next(error);
+  }
+};
+
+const reactivateUserAccount = async (req, res, next) => {
+  try {
+    const { notes, approvedBy } = req.body || {};
+
+    const { user, record } = await reactivateAccount({
+      userId: req.params.userId,
+      notes,
+      adminId: req.admin.id,
+      approvedBy,
+      req,
+    });
+
+    return sendSuccess(
+      res,
+      { userId: user.id, deactivatedAt: null, recordId: record.id, approvedBy: record.approvedBy },
+      'Account reactivated',
+    );
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    next(error);
+  }
+};
+
+const getUserAccountStatusHistory = async (req, res, next) => {
+  try {
+    const history = await getAccountStatusHistory(req.params.userId);
+    return sendSuccess(res, history);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const { buildStatementData, exportStatementCsv, exportStatementPdf } = require('../wallet/statement.service');
+
+const getUserStatement = async (req, res, next) => {
+  try {
+    const { startDate, endDate, asset, format = 'json' } = req.query;
+    const userId = req.params.userId;
+
+    if (format === 'csv') {
+      const { csv, statementId } = await exportStatementCsv({
+        userId,
+        startDate,
+        endDate,
+        asset,
+        actingActor: { type: 'administrator', id: req.admin.id },
+        req,
+      });
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="statement-${userId}-${statementId}.csv"`);
+      return res.status(200).send(csv);
+    }
+
+    if (format === 'pdf') {
+      const { pdfBuffer, statementId } = await exportStatementPdf({
+        userId,
+        startDate,
+        endDate,
+        asset,
+        actingActor: { type: 'administrator', id: req.admin.id },
+        req,
+      });
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="statement-${userId}-${statementId}.pdf"`);
+      return res.status(200).send(pdfBuffer);
+    }
+
+    const statement = await buildStatementData({
+      userId,
+      startDate,
+      endDate,
+      asset,
+    });
+
+    return sendSuccess(res, statement, 'Customer account statement generated');
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    next(error);
+  }
+};
+
+const getKycExpiryStatus = async (req, res, next) => {
+  try {
+    const { getVerificationExpiryStatus } = require('../compliance/verification.expiry');
+    const profile = await prisma.kycProfile.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!profile) return sendError(res, 'KYC profile not found', 404);
+    return sendSuccess(res, getVerificationExpiryStatus(profile));
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getComplianceExpirySummary = async (req, res, next) => {
+  try {
+    const { isSanctionExpired, isKycStale, isEscalationDue } = require('../compliance/verification.expiry');
+    const profiles = await prisma.kycProfile.findMany({
+      where: { status: { in: ['approved', 'not_started'] } },
+      select: {
+        id: true,
+        status: true,
+        updatedAt: true,
+        lastScreenedAt: true,
+        sanctionsStatus: true,
+        metadata: true,
+        user: { select: { anonymizedAt: true } },
+      },
+    });
+
+    const active = profiles.filter((p) => !p.user?.anonymizedAt);
+    const summary = {
+      total: active.length,
+      sanctionExpired: active.filter(isSanctionExpired).length,
+      kycStale: active.filter(isKycStale).length,
+      escalationDue: active.filter(isEscalationDue).length,
+      missingVerification: active.filter((p) => p.status === 'not_started').length,
+    };
+
+    return sendSuccess(res, summary);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const {
+  listDeadLetterJobs,
+  getDeadLetterJob,
+  replayDeadLetterJob: replayDlqJob,
+  discardDeadLetterJob: discardDlqJob,
+} = require('../queues/dlq.service');
+
+const getDeadLetterJobs = async (req, res, next) => {
+  try {
+    const { status, limit } = req.query;
+    const jobs = await listDeadLetterJobs({
+      status,
+      limit: limit ? Number(limit) : 50,
+    });
+    return sendSuccess(res, { jobs });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getDeadLetterJobById = async (req, res, next) => {
+  try {
+    const job = await getDeadLetterJob(req.params.id);
+    if (!job) return sendError(res, 'Dead letter job not found', 404);
+    return sendSuccess(res, { job });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const replayDeadLetterJobHandler = async (req, res, next) => {
+  try {
+    const adminId = req.admin?.id || 'system';
+    const result = await replayDlqJob(req.params.id, {
+      actorId: adminId,
+    });
+    return sendSuccess(res, result, 'Dead letter job replay processed');
+  } catch (error) {
+    next(error);
+  }
+};
+
+const discardDeadLetterJobHandler = async (req, res, next) => {
+  try {
+    const adminId = req.admin?.id || 'system';
+    const result = await discardDlqJob(req.params.id, {
+      actorId: adminId,
+    });
+    return sendSuccess(res, result, 'Dead letter job discarded');
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   login,
   acceptInvite,
   logout,
+  changePassword,
+  me,
   listAdministrators,
   inviteAdministrator,
   updateAdministratorRole,
@@ -477,12 +1104,45 @@ module.exports = {
   getStats,
   getUsers,
   getWallets,
+  getTransaction,
   getTransactions,
   getKycProfiles,
   getAuditLogs,
+  exportTransactions,
   exportKyc,
   exportAuditLogs,
   getSystemHealth,
   refundTransaction,
+  getStuckPayments,
+  retryStuckPayment: actOnStuckPayment('retry'),
+  markStuckPaymentResolved: actOnStuckPayment('mark_resolved'),
+  escalateStuckPayment: actOnStuckPayment('escalate'),
+  getLedgerDiscrepancies,
   verifyAuditLogs,
+  getWalletSummary,
+  recoverWallet,
+  getSecretRotationStatus,
+  rotateSecret,
+  revealSensitiveFields,
+  getWorkflowEvents,
+  verifyEventChain,
+  exportWorkflowEvents,
+  getUserEvidencePackage,
+  downloadUserEvidencePackage,
+  exportKycEvidence,
+  exportAccountStatusHistory,
+  getUserOnboardingStatus,
+  deactivateUserAccount,
+  reactivateUserAccount,
+  getUserAccountStatusHistory,
+  getUserStatement,
+  getKycExpiryStatus,
+  getComplianceExpirySummary,
+  getDeadLetterJobs,
+  getDeadLetterJobById,
+  replayDeadLetterJob: replayDeadLetterJobHandler,
+  discardDeadLetterJob: discardDeadLetterJobHandler,
 };
+
+
+

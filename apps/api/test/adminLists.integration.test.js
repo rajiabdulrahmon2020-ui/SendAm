@@ -2,6 +2,10 @@ const { test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 
+const eq = (a, b) => (a instanceof Date || b instanceof Date)
+  ? new Date(a).getTime() === new Date(b).getTime()
+  : a === b;
+
 const matches = (row, where) => {
   if (!where || Object.keys(where).length === 0) return true;
   return Object.entries(where).every(([key, cond]) => {
@@ -11,9 +15,6 @@ const matches = (row, where) => {
     const value = row[key];
     if (cond && typeof cond === 'object' && !Array.isArray(cond)) {
       return Object.entries(cond).every(([op, operand]) => {
-        const eq = (a, b) => (a instanceof Date || b instanceof Date)
-          ? new Date(a).getTime() === new Date(b).getTime()
-          : a === b;
         switch (op) {
           case 'equals': return eq(value, operand);
           case 'contains': return String(value).toLowerCase().includes(String(operand).toLowerCase());
@@ -82,7 +83,7 @@ const inject = (relative, exports) => {
   require.cache[filename] = { id: filename, filename, loaded: true, exports };
 };
 inject('../src/common/prisma', fakePrisma);
-inject('../src/config/env', { admin: { sessionTtlHours: 12 }, jwtSecret: 'test-secret' });
+inject('../src/config/env', { admin: { sessionTtlHours: 12 }, jwtSecret: 'test-secret', encryptionKey: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' });
 
 const controller = require('../src/controllers/admin.controller');
 
@@ -173,4 +174,58 @@ test('audit export is audited', async () => {
   await controller.exportAuditLogs(makeReq(), res, () => {});
   assert.equal(res.statusCode, 200);
   assert.ok(auditCalls.some((c) => c.action === 'admin.audit.export'));
+});
+
+test('kyc pagination has no omissions or duplicates when a row is inserted mid-traversal', async () => {
+  // Snapshot the full expected id order before any concurrent insert.
+  const page1 = makeRes();
+  await controller.getKycProfiles(makeReq({ limit: '1' }), page1, () => {});
+  assert.equal(page1.body.data.length, 1);
+  assert.equal(page1.body.data[0]._id, 'k1'); // most recently updated
+  const cursorAfterPage1 = page1.body.pagination.nextCursor;
+  assert.ok(cursorAfterPage1);
+
+  // Simulate a concurrent insert: a brand-new profile more recently updated
+  // than k1, i.e. it would sort ahead of the cursor position.
+  kycProfiles.unshift({
+    id: 'k-new',
+    status: 'pending',
+    country: 'KE',
+    user: { phoneNumber: '+999' },
+    updatedAt: new Date(2024, 0, 4),
+  });
+
+  // Continue from the cursor taken before the insert.
+  const page2 = makeRes();
+  await controller.getKycProfiles(makeReq({ limit: '1', after: cursorAfterPage1 }), page2, () => {});
+
+  // k2 must still appear exactly once, not skipped and not duplicated,
+  // and the newly-inserted row (which sorts ahead of the cursor) must not
+  // leak into this page since it's positioned before the cursor, not after it.
+  assert.equal(page2.body.data.length, 1);
+  assert.equal(page2.body.data[0]._id, 'k2');
+
+  // Cleanup so this test doesn't bleed into others.
+  kycProfiles.shift();
+});
+
+test('invalid cursor on kyc/audit endpoints returns 400', async () => {
+  let captured;
+  await controller.getKycProfiles(makeReq({ after: '%%%not-a-cursor' }), makeRes(), (e) => { captured = e; });
+  assert.ok(captured);
+  assert.equal(captured.statusCode, 400);
+
+  captured = undefined;
+  await controller.getAuditLogs(makeReq({ after: '%%%not-a-cursor' }), makeRes(), (e) => { captured = e; });
+  assert.ok(captured);
+  assert.equal(captured.statusCode, 400);
+});
+
+test('audit actorId filter applies server-side', async () => {
+  auditLogs.push({ id: 'a3', actorType: 'administrator', actorId: 'admin-42', action: 'admin.kyc.approve', entityType: 'KycProfile', createdAt: new Date(2024, 0, 4) });
+  const res = makeRes();
+  await controller.getAuditLogs(makeReq({ actorId: 'admin-42' }), res, () => {});
+  assert.equal(res.body.data.length, 1);
+  assert.equal(res.body.data[0]._id, 'a3');
+  auditLogs.pop();
 });

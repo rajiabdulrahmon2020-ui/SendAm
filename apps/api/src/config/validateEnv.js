@@ -4,8 +4,21 @@
 // found — an operator fixing ENCRYPTION_KEY only to hit JWT_SECRET on the
 // next boot is a bad debugging loop. This runs once, explicitly, before the
 // app starts accepting connections, and reports every violation at once.
-// Circle's Testnet USDC issuer — must never be used on mainnet.
-const TESTNET_USDC_ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+// Circle's Testnet USDC issuer — must never be used on mainnet. Sourced from
+// the network profiles so this constant cannot drift from the one the rest of
+// the service resolves against.
+const { TESTNET_USDC_ISSUER } = require('./networkProfiles');
+
+const hasTls = (url, protocol) => {
+  try {
+    const parsed = new URL(url);
+    return protocol === 'postgres'
+      ? ['require', 'verify-ca', 'verify-full'].includes(parsed.searchParams.get('sslmode'))
+      : parsed.protocol === 'rediss:';
+  } catch (_error) {
+    return false;
+  }
+};
 
 const validateEnv = (config) => {
   const problems = [];
@@ -24,6 +37,24 @@ const validateEnv = (config) => {
 
   if (config.isProduction && !config.whatsapp.appSecret) {
     problems.push('WHATSAPP_APP_SECRET must be set in production — without it, inbound webhook signatures cannot be verified.');
+  }
+
+  if (config.isProduction) {
+    if (!config.databaseUrl || !hasTls(config.databaseUrl, 'postgres')) {
+      problems.push('DATABASE_URL must use PostgreSQL TLS (sslmode=require, verify-ca, or verify-full) in production.');
+    }
+    if (!config.redis?.url || !hasTls(config.redis.url, 'redis')) {
+      problems.push('REDIS_URL or UPSTASH_REDIS_URL must use rediss:// TLS in production.');
+    }
+    if (!Number.isInteger(config.databasePool?.max) || config.databasePool.max < 1) {
+      problems.push('DATABASE_POOL_MAX must be a positive integer in production.');
+    }
+    if (!Number.isFinite(config.databasePool?.connectionTimeoutMs) || config.databasePool.connectionTimeoutMs < 1) {
+      problems.push('DATABASE_CONNECTION_TIMEOUT_MS must be positive in production.');
+    }
+    if (!Number.isFinite(config.databasePool?.poolTimeoutMs) || config.databasePool.poolTimeoutMs < 1) {
+      problems.push('DATABASE_POOL_TIMEOUT_MS must be positive in production.');
+    }
   }
 
   if (config.isProduction && config.messageTransport === 'meta') {
@@ -65,6 +96,16 @@ const validateEnv = (config) => {
     problems.push(`MESSAGE_TRANSPORT must be either 'meta' or 'sim' (got '${config.messageTransport}').`);
   }
 
+  // Network coherence (#284). env.js resolves STELLAR_NETWORK into a full
+  // profile — passphrase, Horizon hosts, asset issuer, Friendbot availability —
+  // and collects every inconsistency rather than throwing on the first. An
+  // unrecognised network name, a Horizon endpoint belonging to another network,
+  // an issuer that does not match, or an unconfirmed mainnet selection all
+  // surface here and prevent startup.
+  if (Array.isArray(config.stellar?.networkProblems) && config.stellar.networkProblems.length) {
+    problems.push(...config.stellar.networkProblems);
+  }
+
   // Mainnet safety: the testnet USDC issuer must never be used on mainnet.
   // This prevents accidental misconfiguration that could cause funds to be
   // sent to or received from an uncontrolled testnet issuer.
@@ -104,7 +145,29 @@ const validateWorkerEnv = (config) => {
   if (!Number.isFinite(config.worker?.lockDurationMs) || config.worker.lockDurationMs < 5000) {
     problems.push('WORKER_LOCK_DURATION_MS must be at least 5000.');
   }
+  if (!Number.isInteger(config.worker?.healthPort) || config.worker.healthPort < 1 || config.worker.healthPort > 65535) {
+    problems.push('WORKER_HEALTH_PORT must be an integer between 1 and 65535.');
+  }
+  if (!Number.isFinite(config.worker?.heartbeatFreshnessMs)
+      || config.worker.heartbeatFreshnessMs < config.worker.heartbeatIntervalMs) {
+    problems.push('WORKER_HEARTBEAT_FRESHNESS_MS must be at least WORKER_HEARTBEAT_INTERVAL_MS.');
+  }
+  if (!Number.isFinite(config.worker?.metricsIntervalMs) || config.worker.metricsIntervalMs < 1000) {
+    problems.push('WORKER_METRICS_INTERVAL_MS must be at least 1000.');
+  }
   if (problems.length) throw new Error(`Invalid worker configuration:\n  - ${problems.join('\n  - ')}`);
 };
 
-module.exports = { validateEnv, validateWorkerEnv };
+const validateDeploymentManifest = () => {
+  try {
+    const { validateManifestAtStartup } = require('./deploymentManifest');
+    const result = validateManifestAtStartup();
+    if (!result.skipped && !result.valid) {
+      throw new Error(result.reason || 'Deployment manifest verification failed.');
+    }
+  } catch (error) {
+    throw new Error(`Deployment manifest verification failed:\n  - ${error.message}`);
+  }
+};
+
+module.exports = { validateEnv, validateWorkerEnv, validateDeploymentManifest };

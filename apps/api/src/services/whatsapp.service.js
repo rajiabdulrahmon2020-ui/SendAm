@@ -1,8 +1,139 @@
 const axios = require('axios');
+const { randomUUID } = require('node:crypto');
 const config = require('../config/env');
 const logger = require('../utils/logger');
+const prisma = require('../common/prisma');
+const { enqueue } = require('../queues/queue.service');
 const { increment } = require('../observability/metrics');
+const { outboundHeaders } = require('../observability/context');
 const { ProviderSkippedError } = require('../compliance/providerErrors');
+
+const RETRYABLE_META_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+
+const isRetryableMetaFailure = (error) => {
+  const status = Number(error?.response?.status || error?.status || 0);
+  if (RETRYABLE_META_STATUS_CODES.has(status)) return true;
+  const haystack = `${error?.message || ''} ${JSON.stringify(error?.response?.data || {})}`.toLowerCase();
+  return /(timeout|temporar|rate limit|too many|throttl|network|unavailable|busy)/i.test(haystack);
+};
+
+const deliverMetaTextMessage = async (to, body, axiosImpl = axios) => {
+  const url = `https://graph.facebook.com/v19.0/${config.whatsapp.phoneNumberId}/messages`;
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'text',
+    text: {
+      preview_url: false,
+      body,
+    },
+  };
+
+  const response = await axiosImpl.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${config.whatsapp.token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  return response.data;
+};
+
+const persistOutboundNotification = async ({ to, body, prismaClient = prisma, error = null, retryable = false }) => {
+  const notificationClient = prismaClient.notification;
+  if (!notificationClient?.create) return null;
+
+  const created = await notificationClient.create({
+    data: {
+      userId: null,
+      channel: 'whatsapp',
+      type: 'outbound_message',
+      recipient: to,
+      body,
+      status: retryable ? 'queued' : 'failed',
+      error: error ? String(error.message || error.response?.data || error) : null,
+      metadata: {
+        retryable,
+        errorCode: error?.response?.data?.error?.code || error?.response?.data?.error?.error_subcode || null,
+        retryCount: 0,
+      },
+    },
+  });
+
+  if (retryable) {
+    await enqueue('whatsapp-outbound-retry', 'notification.retry', {
+      notificationId: created.id,
+      to,
+      body,
+      attempts: 0,
+    });
+  }
+
+  return created;
+};
+
+const retryOutboundNotification = async ({ notificationId, to, body, attempts = 0, axiosImpl = axios, prismaClient = prisma }) => {
+  const notification = await prismaClient.notification.findUnique({ where: { id: notificationId } });
+  if (!notification) return { status: 'missing' };
+
+  if (['failed', 'dead_letter', 'sent'].includes(notification.status)) {
+    return { status: notification.status, notification };
+  }
+
+  try {
+    const response = await deliverMetaTextMessage(to, body, axiosImpl);
+    const providerMessageId = response?.messages?.[0]?.id || response?.message_id || null;
+
+    await prismaClient.notification.update({
+      where: { id: notificationId },
+      data: {
+        status: 'sent',
+        providerMessageId,
+        metadata: {
+          ...(notification.metadata || {}),
+          lastAttemptAt: new Date().toISOString(),
+          retryCount: Number(attempts || 0),
+        },
+      },
+    });
+
+    return { status: 'sent', notificationId, providerMessageId };
+  } catch (error) {
+    const retryable = isRetryableMetaFailure(error);
+    const nextAttempts = attempts + 1;
+    const isTerminal = nextAttempts >= 4;
+
+    await prismaClient.notification.update({
+      where: { id: notificationId },
+      data: {
+        status: isTerminal ? 'dead_letter' : 'queued',
+        error: String(error.message || error.response?.data || error),
+        metadata: {
+          ...(notification.metadata || {}),
+          retryable,
+          lastAttemptAt: new Date().toISOString(),
+          retryCount: nextAttempts,
+          lastError: String(error.message || error.response?.data || error),
+        },
+      },
+    });
+
+    if (retryable && !isTerminal) {
+      await enqueue('whatsapp-outbound-retry', 'notification.retry', {
+        notificationId,
+        to,
+        body,
+        attempts: nextAttempts,
+      }, {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 15000 },
+      });
+    }
+
+    return { status: isTerminal ? 'dead_letter' : 'queued', notificationId, retryable };
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Delivery status state machine (#159)
@@ -16,6 +147,55 @@ const { ProviderSkippedError } = require('../compliance/providerErrors');
 // ---------------------------------------------------------------------------
 const STATUS_RANK = { sent: 1, delivered: 2, read: 3, failed: 4 };
 const MAX_OUTBOUND_RETRIES = 2;
+const activeSendControllers = new Set();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const waitForRetry = async (ms, sleepImpl, signal) => {
+  if (signal.aborted) return;
+  let onAbort;
+  await Promise.race([
+    sleepImpl(ms),
+    new Promise((resolve) => {
+      onAbort = resolve;
+      signal.addEventListener('abort', resolve, { once: true });
+    }),
+  ]);
+  signal.removeEventListener('abort', onAbort);
+};
+
+const cancelInFlightSends = (reason = 'shutdown') => {
+  for (const controller of activeSendControllers) controller.abort({ type: 'shutdown', message: reason });
+  return activeSendControllers.size;
+};
+
+const errorDetails = (error, kind) => ({
+  kind,
+  status: error.response?.status || null,
+  code: error.code || null,
+  message: String(error.response?.data?.error?.message || error.message || kind).slice(0, 500),
+});
+
+const classifySynchronousFailure = (error, signal) => {
+  if (signal.aborted) {
+    const cancelled = ['shutdown', 'caller'].includes(signal.reason?.type);
+    return { outcome: 'unknown', retryable: false, error: errorDetails(error, cancelled ? 'cancelled' : 'timeout') };
+  }
+  const status = error.response?.status;
+  if (status === 429 || status >= 500) {
+    return { outcome: 'transient_failure', retryable: true, error: errorDetails(error, 'http') };
+  }
+  if (status >= 400 && status < 500) {
+    return { outcome: 'permanent_failure', retryable: false, error: errorDetails(error, 'http') };
+  }
+  if (['ECONNABORTED', 'ETIMEDOUT'].includes(error.code)) {
+    return { outcome: 'unknown', retryable: false, error: errorDetails(error, 'timeout') };
+  }
+  if (['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ENETUNREACH'].includes(error.code)) {
+    return { outcome: 'transient_failure', retryable: true, error: errorDetails(error, 'network') };
+  }
+  return { outcome: 'unknown', retryable: false, error: errorDetails(error, 'network') };
+};
 
 // Meta error codes seen on `statuses[].errors[].code`. Only failures known to
 // be transient (rate limiting, temporary delivery problems) are retried.
@@ -50,32 +230,37 @@ const classifyWhatsappFailure = (errorCode) => {
   return { retryable: false, reason: 'unknown' };
 };
 
-const sendTextMessage = async (to, body, options = {}) => {
+const CONVERSATION_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const isWithinConversationWindow = (lastCustomerInteractionAt) => {
+  if (!lastCustomerInteractionAt) return false;
+  const lastTime = new Date(lastCustomerInteractionAt).getTime();
+  if (Number.isNaN(lastTime)) return false;
+  return Date.now() - lastTime <= CONVERSATION_WINDOW_MS;
+};
+
+const sendTemplateMessage = async (to, templateName, languageCode = 'en', components = [], options = {}) => {
   const {
     messageTransport = config.messageTransport,
-    prisma = null,
+    prisma: prismaClient = null,
     axiosImpl = axios,
     notification = null,
   } = options;
 
-  // Notification recording is opt-in: callers that care about delivery
-  // lifecycle (financial receipts, deposit alerts, voice replies) pass
-  // `notification`; low-stakes replies (menus, throttle warnings) don't pay
-  // the write. Only touch prisma when there's something to record.
-  const db = notification ? (prisma || require('../common/prisma')) : null;
+  const db = notification ? (prismaClient || prisma || require('../common/prisma')) : null;
 
   try {
     if (messageTransport === 'sim') {
-      const simDb = prisma || require('../common/prisma');
+      const simDb = prismaClient || prisma || require('../common/prisma');
       const result = await simDb.simMessage.create({
         data: {
           phoneNumber: to,
           direction: 'out',
-          text: body,
+          text: `[Template: ${templateName}]`,
         },
       });
       if (db && notification) {
-        await recordNotificationCreated(db, notification, { to, body, providerMessageId: null, status: 'sent' });
+        await recordNotificationCreated(db, notification, { to, body: `[Template: ${templateName}]`, providerMessageId: null, status: 'sent' });
       }
       return result;
     }
@@ -86,25 +271,26 @@ const sendTextMessage = async (to, body, options = {}) => {
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
       to: to,
-      type: 'text',
-      text: {
-        preview_url: false,
-        body: body,
-      }
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: languageCode },
+        ...(components && components.length ? { components } : {}),
+      },
     };
 
     const response = await axiosImpl.post(url, payload, {
       headers: {
         'Authorization': `Bearer ${config.whatsapp.token}`,
-        'Content-Type': 'application/json'
-      }
+        'Content-Type': 'application/json',
+      },
     });
 
     if (db && notification) {
       const providerMessageId = response.data?.messages?.[0]?.id || null;
       await recordNotificationCreated(db, notification, {
         to,
-        body,
+        body: `[Template: ${templateName}]`,
         providerMessageId,
         status: providerMessageId ? 'sent' : 'queued',
       });
@@ -112,19 +298,236 @@ const sendTextMessage = async (to, body, options = {}) => {
 
     return response.data;
   } catch (error) {
-    logger.error('WhatsApp API Error:', error.response?.data || error.message);
+    logger.error('WhatsApp Template API Error:', error.response?.data || error.message);
+    if (db && notification) {
+      await recordNotificationCreated(db, notification, {
+        to,
+        body: `[Template: ${templateName}]`,
+        providerMessageId: null,
+        status: 'failed',
+        error: String(error.response?.data?.error?.message || error.message || 'template send failed').slice(0, 500),
+      });
+    }
+    return null;
+  }
+};
+
+/**
+ * @typedef {'accepted'|'transient_failure'|'permanent_failure'|'unknown'} SendOutcome
+ * @typedef {{outcome: SendOutcome, correlationId: string, attempts: number,
+ *   providerMessageId?: string, retryable?: boolean, data?: object,
+ *   error?: {kind: string, status: number|null, code: string|null, message: string}}} SendResult
+ */
+
+/** @returns {Promise<SendResult>} */
+const sendTextMessage = async (to, body, options = {}) => {
+  const {
+    messageTransport = config.messageTransport,
+    prisma: prismaClient = null,
+    axiosImpl = axios,
+    notification = null,
+    enforceWindow = false,
+    lastCustomerInteractionAt = null,
+    templateName = null,
+    templateLanguage = 'en',
+    templateComponents = [],
+    signal: callerSignal = null,
+    correlationId: providedCorrelationId = null,
+    sleepImpl = sleep,
+  } = options;
+  const { getContext } = require('../observability/context');
+  const outbox = require('./notificationOutbox.service');
+  const correlationId = providedCorrelationId
+    || getContext().correlationId
+    || (notification?.referenceType && notification?.referenceId
+      ? `${notification.referenceType}:${notification.referenceId}`
+      : randomUUID());
+
+  // Meta 24-hour Customer Service Window Enforcement (#190)
+  if (enforceWindow && !isWithinConversationWindow(lastCustomerInteractionAt)) {
+    if (templateName) {
+      const data = await sendTemplateMessage(to, templateName, templateLanguage, templateComponents, options);
+      const providerMessageId = data?.messages?.[0]?.id || null;
+      return { outcome: data ? 'accepted' : 'unknown', providerMessageId, correlationId, attempts: 1, data };
+    }
+    logger.warn('whatsapp_window_expired', { to, lastCustomerInteractionAt });
+    const db = notification ? (prismaClient || prisma || require('../common/prisma')) : null;
     if (db && notification) {
       await recordNotificationCreated(db, notification, {
         to,
         body,
         providerMessageId: null,
         status: 'failed',
-        error: String(error.response?.data?.error?.message || error.message || 'send failed').slice(0, 500),
+        error: 'Meta customer service window expired (24h). Approved template required.',
       });
     }
-    // Don't throw to prevent webhook failures when whatsapp is misconfigured
-    return null;
+    return {
+      outcome: 'permanent_failure', retryable: false, correlationId, attempts: 1,
+      error: { kind: 'conversation_window', status: null, code: null, message: 'Meta customer service window expired (24h). Approved template required.' },
+    };
   }
+
+  // Notification recording is opt-in: callers that care about delivery
+  // lifecycle (financial receipts, deposit alerts, voice replies) pass
+  // `notification`; low-stakes replies (menus, throttle warnings) don't pay
+  // the write. Only touch prisma when there's something to record.
+  const db = notification ? (prismaClient || prisma || require('../common/prisma')) : null;
+
+  // #286: the durable intent is written *before* the provider is called, so a
+  // crash after Meta accepts but before we record still leaves a row to
+  // reconcile. `reserved` is null only when persistence failed for a
+  // notification that does not require durability; for those that do,
+  // reserveOutboundNotification throws and the send does not happen.
+  let reserved = null;
+  if (db && notification && outbox.requiresDurableRecord(notification)) {
+    reserved = await outbox.reserveOutboundNotification(db, { notification, to, body });
+
+    if (reserved) {
+      // An earlier attempt already carried this send to a terminal state;
+      // re-sending would duplicate it.
+      if (reserved.status === outbox.STATUS.SENT) return null;
+
+      const claimed = await outbox.claimForSend(db, reserved.id);
+      if (!claimed) {
+        // Another attempt owns this send, or it is already resolved.
+        logger.warn('whatsapp_send_not_claimed', { notificationId: reserved.id, status: reserved.status });
+        return null;
+      }
+    }
+  }
+
+  if (messageTransport === 'sim') {
+    try {
+      const simDb = prismaClient || prisma || require('../common/prisma');
+      const result = await simDb.simMessage.create({
+        data: {
+          phoneNumber: to,
+          direction: 'out',
+          text: body,
+        },
+      });
+      if (reserved) {
+        await outbox.attachProviderResult(db, reserved.id, { providerMessageId: null, status: 'sent' });
+      } else if (db && notification) {
+        await recordNotificationCreated(db, notification, { to, body, providerMessageId: null, status: 'sent' });
+      }
+      return { outcome: 'accepted', providerMessageId: null, correlationId, attempts: 1, data: result };
+    } catch (error) {
+      return { outcome: 'permanent_failure', retryable: false, correlationId, attempts: 1, error: errorDetails(error, 'storage') };
+    }
+  }
+
+  const url = `https://graph.facebook.com/${config.whatsapp.graphApiVersion || 'v19.0'}/${config.whatsapp.phoneNumberId}/messages`;
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'text',
+    text: { preview_url: false, body },
+    biz_opaque_callback_data: String(correlationId).slice(0, 512),
+  };
+
+  const controller = new AbortController();
+  activeSendControllers.add(controller);
+  const onCallerAbort = () => controller.abort({ type: 'caller', message: 'caller cancelled' });
+  callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+  if (callerSignal?.aborted) onCallerAbort();
+  const connectDeadline = setTimeout(
+    () => controller.abort({ type: 'timeout', message: 'connection deadline exceeded' }),
+    config.whatsapp.connectTimeoutMs,
+  );
+
+  let finalResult;
+  const maxAttempts = Math.max(1, Number(config.whatsapp.maxSendRetries || 0) + 1);
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const response = await axiosImpl.post(url, payload, {
+          headers: {
+            'Authorization': `Bearer ${config.whatsapp.token}`,
+            'Content-Type': 'application/json',
+            ...outboundHeaders(),
+          },
+          timeout: config.whatsapp.responseTimeoutMs,
+          signal: controller.signal,
+        });
+        const providerMessageId = response.data?.messages?.[0]?.id;
+        finalResult = providerMessageId && typeof providerMessageId === 'string'
+          ? { outcome: 'accepted', providerMessageId, correlationId, attempts: attempt, data: response.data }
+          : {
+            outcome: 'unknown', retryable: false, correlationId, attempts: attempt,
+            error: { kind: 'malformed_response', status: response.status || 200, code: null, message: 'Meta response did not contain a message id' },
+          };
+        break;
+      } catch (error) {
+        const classified = classifySynchronousFailure(error, controller.signal);
+        finalResult = { ...classified, correlationId, attempts: attempt };
+        if (!classified.retryable || attempt === maxAttempts) break;
+        const retryAfterSeconds = Number(error.response?.headers?.['retry-after']);
+        const delay = Number.isFinite(retryAfterSeconds)
+          ? retryAfterSeconds * 1000
+          : config.whatsapp.retryBaseDelayMs * (2 ** (attempt - 1));
+        await waitForRetry(delay, sleepImpl, controller.signal);
+        if (controller.signal.aborted) {
+          finalResult = {
+            outcome: 'unknown', retryable: false, correlationId, attempts: attempt,
+            error: errorDetails(new Error('send cancelled'), controller.signal.reason?.type === 'timeout' ? 'timeout' : 'cancelled'),
+          };
+          break;
+        }
+      }
+    }
+  } finally {
+    clearTimeout(connectDeadline);
+    callerSignal?.removeEventListener('abort', onCallerAbort);
+    activeSendControllers.delete(controller);
+  }
+
+  const providerMessageId = finalResult.providerMessageId || null;
+  if (reserved) {
+    if (finalResult.outcome === 'accepted') {
+      await outbox.attachProviderResult(db, reserved.id, {
+        providerMessageId,
+        status: providerMessageId ? 'sent' : 'queued',
+      });
+    } else {
+      const reason = String(finalResult.error?.message || 'send failed').slice(0, 500);
+      if (finalResult.outcome === 'permanent_failure') {
+        await outbox.markSendFailed(db, reserved.id, reason);
+      } else {
+        await outbox.markUnresolved(db, reserved.id, `no provider response: ${reason}`);
+      }
+    }
+  } else if (db && notification) {
+    const status = finalResult.outcome === 'accepted'
+      ? 'queued'
+      : (finalResult.outcome === 'unknown' ? 'unknown' : 'failed');
+    await recordNotificationCreated(db, notification, {
+      to,
+      body,
+      providerMessageId,
+      status,
+      error: finalResult.error?.message || null,
+    });
+  }
+
+  if (finalResult.outcome !== 'accepted') {
+    logger.error('whatsapp_send_failed', { correlationId, ...finalResult.error, attempts: finalResult.attempts });
+    if (finalResult.outcome === 'transient_failure' || finalResult.retryable) {
+      const dbClient = prismaClient || (options.prisma !== undefined ? options.prisma : (prisma || require('../common/prisma')));
+      await persistOutboundNotification({
+        to,
+        body,
+        prismaClient: dbClient,
+        error: finalResult.error?.message || finalResult.error,
+        retryable: true,
+      });
+      return null;
+    }
+  }
+
+  return finalResult;
 };
 
 /**
@@ -306,14 +709,21 @@ const deleteUserData = async (phoneNumber) => {
   await axios.post(url, {
     user_id: phoneNumber,
     app_id: config.whatsapp.appId || process.env.WHATSAPP_APP_ID,
-  }, { timeout: 30000, headers: { 'content-type': 'application/json' } });
+  }, { timeout: 30000, headers: { 'content-type': 'application/json', ...outboundHeaders() } });
   return { status: 'success' };
 };
 
 module.exports = {
   sendTextMessage,
+  sendTemplateMessage,
+  retryOutboundNotification,
+  isRetryableMetaFailure,
+  isWithinConversationWindow,
+  CONVERSATION_WINDOW_MS,
   recordDeliveryStatus,
   classifyWhatsappFailure,
   deleteUserData,
   STATUS_RANK,
+  cancelInFlightSends,
+  classifySynchronousFailure,
 };

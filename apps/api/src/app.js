@@ -12,17 +12,29 @@ const pricingRoutes = require('./pricing/pricing.routes');
 const simRoutes = require('./routes/sim.routes');
 const authRoutes = require('./routes/auth.routes');
 const receiptRoutes = require('./routes/receipt.routes');
+const retentionRoutes = require('./routes/retention.routes');
 
 const errorHandler = require('./middlewares/errorHandler');
 const notFound = require('./middlewares/notFound');
 const PostgresRateStore = require('./middlewares/postgresRateStore');
 const config = require('./config/env');
+const { getTrustProxySetting, sanitizeForwardingHeaders } = require('./config/proxy');
+const { describeNetworkProfile } = require('./config/networkProfiles');
 const logger = require('./utils/logger');
 const prisma = require('./common/prisma');
-const { correlationMiddleware } = require('./observability/context');
-const { requestMetrics, metricsHandler, increment } = require('./observability/metrics');
+const { AppError } = require('./errors');
+const { correlationMiddleware, getContext } = require('./observability/context');
+const { requestMetrics, getMetricSnapshot, metricsHandler, increment } = require('./observability/metrics');
+const { pingRedis } = require('./queues/queue.service');
 
 const app = express();
+let startupComplete = false;
+
+app.set('trust proxy', getTrustProxySetting());
+app.use((req, _res, next) => {
+  sanitizeForwardingHeaders(req);
+  next();
+});
 
 // Middlewares
 app.use(correlationMiddleware);
@@ -87,26 +99,23 @@ app.use((err, req, res, next) => {
 // Access logs: the verbose, colorized 'dev' format is great locally but unfit
 // for production log aggregation. Use the standard Apache 'combined' format in
 // production so hosted log drains get parseable, complete request lines.
-if (!config.isProduction) app.use(morgan('dev'));
-app.use((req, res, next) => {
-  const started = process.hrtime.bigint();
-  res.on('finish', () => logger.info('http_request_completed', {
-    method: req.method,
-    path: req.path,
-    statusCode: res.statusCode,
-    durationMs: Number(process.hrtime.bigint() - started) / 1e6,
-  }));
-  next();
-});
+app.use(morgan(config.isProduction ? 'combined' : 'dev'));
+app.use(requestMetrics);
 
-// Capture the raw request body so the WhatsApp webhook can verify the
-// X-Hub-Signature-256 HMAC against exactly what Meta signed.
-app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-app.use(express.urlencoded({ extended: true }));
+// Body limit breaches are safe and observable.
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.too.large') {
+    increment('sendam_body_limit_exceeded_total', { route: req.path });
+    if (!res.headersSent) {
+      return res.status(413).json({ error: 'payload_too_large' });
+    }
+  }
+  next(err);
+});
 
 // Rate limiting (REST). PostgreSQL-backed store so the per-IP window is shared
 // across instances. The WhatsApp webhook is throttled separately, per sender,
-// in its controller — Meta proxies all events through a few IPs, so an IP
+// in its controller — Meta proxies all events through a few IPS, so an IP
 // limiter there would throttle every user together.
 const limiter = rateLimit({
   windowMs: config.rateLimit.apiWindowMs,
@@ -114,6 +123,9 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: new PostgresRateStore(),
+  // 429s flow through the standard error envelope so clients get a stable
+  // `rate_limited` code instead of the express-rate-limit default shape.
+  handler: (_req, _res, next) => next(new AppError('rate_limited')),
 });
 app.use('/api/', limiter);
 
@@ -121,18 +133,40 @@ app.use('/api/', limiter);
 // traffic spike cannot blind monitoring, and protected by a dedicated token.
 app.get('/metrics', metricsHandler);
 
-// Health check for uptime monitors and platform probes. Not rate-limited and
-// requires no auth; reports 503 if the database link is down.
-app.get('/health', async (req, res) => {
+app.get('/health/live', (_req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime() });
+});
+
+app.get('/health/startup', (_req, res) => {
+  res.status(startupComplete ? 200 : 503).json({ status: startupComplete ? 'ok' : 'starting' });
+});
+
+// Which Stellar network this instance is actually bound to (#284). Operators
+// need to be able to confirm a deployment is on the network they think it is
+// without reading its environment. Only public network identifiers are
+// exposed — no keys, endpoints with credentials, or secrets.
+app.get('/health/network', (_req, res) => {
+  res.status(200).json(describeNetworkProfile(config.stellar.networkProfile));
+});
+
+app.get(['/health', '/health/ready'], async (req, res) => {
+  const correlationId = getContext().correlationId || null;
   try {
-    await prisma.$queryRaw`SELECT 1`;
+    await Promise.race([
+      Promise.all([prisma.$queryRaw`SELECT 1`, pingRedis(config.health.timeoutMs)]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Readiness check timed out')), config.health.timeoutMs)),
+    ]);
     increment('sendam_health_checks_total', { status: 'ok' });
-    res.status(200).json({ status: 'ok', db: 'connected', uptime: process.uptime() });
+    res.status(200).json({ status: 'ok', db: 'connected', redis: 'connected', uptime: process.uptime(), correlationId });
   } catch (error) {
     increment('sendam_health_checks_total', { status: 'degraded' });
-    logger.error('health_check_failed', error);
-    res.status(503).json({ status: 'degraded', db: 'disconnected', uptime: process.uptime() });
+    logger.error('readiness_check_failed', error);
+    res.status(503).json({ status: 'degraded', db: 'unknown', redis: 'unknown', uptime: process.uptime(), correlationId });
   }
+});
+
+app.get('/metrics', (_req, res) => {
+  res.status(200).json(getMetricSnapshot());
 });
 
 // Routes
@@ -152,6 +186,7 @@ if (config.features.walletRestApi) {
 }
 
 app.use('/api/admin', adminRoutes);
+app.use('/api/admin/retention', retentionRoutes);
 app.use('/api/compliance', complianceRoutes);
 app.use('/api/pricing', pricingRoutes);
 
@@ -164,11 +199,13 @@ if (config.features.chatSim) {
   }
   app.use('/api/sim', simRoutes);
 } else {
-  logger.info('Chat simulator (/api/sim) is disabled. Set ENABLE_CHAT_SIM=true to enable.');
+  logger.info('Chat simulator (/api/sim) is disabled. Set enable_CHAT_SIM=true to enable.');
 }
 
 // Error Handling
 app.use(notFound);
 app.use(errorHandler);
+
+app.markStartupComplete = () => { startupComplete = true; };
 
 module.exports = app;

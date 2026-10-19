@@ -22,6 +22,13 @@ const baseConfig = () => ({
 const productionConfig = () => ({
   ...baseConfig(),
   isProduction: true,
+  databaseUrl: 'postgresql://user:pass@localhost:5432/sendam?sslmode=require',
+  redis: { url: 'rediss://localhost:6379' },
+  databasePool: {
+    max: 10,
+    connectionTimeoutMs: 5000,
+    poolTimeoutMs: 10000,
+  },
   compliance: { pinPepper: 'pepper' },
   whatsapp: {
     token: 'system-user-token',
@@ -175,15 +182,23 @@ test('testnet with testnet USDC issuer does not throw', () => {
 });
 
 test('worker requires Redis and valid concurrency settings', () => {
+  const worker = {
+    concurrency: 5,
+    lockDurationMs: 30000,
+    healthPort: 3003,
+    heartbeatIntervalMs: 30000,
+    heartbeatFreshnessMs: 90000,
+    metricsIntervalMs: 15000,
+  };
   assert.throws(
-    () => validateWorkerEnv({ redis: {}, worker: { concurrency: 5, lockDurationMs: 30000 } }),
+    () => validateWorkerEnv({ redis: {}, worker }),
     /REDIS_URL/,
   );
   assert.throws(
-    () => validateWorkerEnv({ redis: { url: 'redis://localhost' }, worker: { concurrency: 0, lockDurationMs: 30000 } }),
+    () => validateWorkerEnv({ redis: { url: 'redis://localhost' }, worker: { ...worker, concurrency: 0 } }),
     /WORKER_CONCURRENCY/,
   );
   assert.doesNotThrow(
-    () => validateWorkerEnv({ redis: { url: 'redis://localhost' }, worker: { concurrency: 5, lockDurationMs: 30000 } }),
+    () => validateWorkerEnv({ redis: { url: 'redis://localhost' }, worker }),
   );
 });

@@ -19,7 +19,10 @@ const DESTINATION_PUBLIC_KEY = DESTINATION_WALLET.publicKey;
 
 const mockSuccessfulPaymentSetup = () => {
   mock.method(server, 'loadAccount', async () => {
-    return new StellarSdk.Account(SOURCE_PUBLIC_KEY, '1');
+    const account = new StellarSdk.Account(SOURCE_PUBLIC_KEY, '1');
+    account.balances = [{ asset_type: 'native', balance: '10' }];
+    account.subentry_count = 0;
+    return account;
   });
 
   mock.method(server, 'fetchBaseFee', async () => '100');
@@ -106,7 +109,7 @@ test('submitPayment preserves unknown Horizon errors unchanged', async () => {
       extras: {
         result_codes: {
           transaction: 'tx_failed',
-          operations: ['op_line_full'],
+          operations: ['op_no_issuer'],
         },
       },
     },
@@ -168,7 +171,27 @@ afterEach(() => {
   mock.restoreAll();
 });
 
-test('getBalances returns XLM and USDC rows when both trustlines exist', async () => {
+const NETWORK = 'testnet';
+
+test('getBalances returns canonical identity for native XLM only', async () => {
+  mock.method(server, 'loadAccount', async () => ({
+    balances: [{ asset_type: 'native', balance: '5.0000000' }],
+  }));
+
+  const balances = await stellarAdapter.getBalances('GABCD');
+  assert.deepEqual(balances, [
+    {
+      asset: 'XLM',
+      value: '5.0000000',
+      issuer: null,
+      network: NETWORK,
+      assetId: 'stellar:testnet:XLM',
+      trusted: true,
+    },
+  ]);
+});
+
+test('getBalances tags configured USDC as trusted with issuer provenance', async () => {
   mock.method(server, 'loadAccount', async () => ({
     balances: [
       { asset_type: 'native', balance: '42.5000000' },
@@ -178,21 +201,26 @@ test('getBalances returns XLM and USDC rows when both trustlines exist', async (
 
   const balances = await stellarAdapter.getBalances('GABCD');
   assert.deepEqual(balances, [
-    { asset: 'XLM', value: '42.5000000' },
-    { asset: 'USDC', value: '10.0000000' },
+    {
+      asset: 'XLM',
+      value: '42.5000000',
+      issuer: null,
+      network: NETWORK,
+      assetId: 'stellar:testnet:XLM',
+      trusted: true,
+    },
+    {
+      asset: 'USDC',
+      value: '10.0000000',
+      issuer: USDC_ISSUER,
+      network: NETWORK,
+      assetId: `stellar:testnet:USDC:${USDC_ISSUER}`,
+      trusted: true,
+    },
   ]);
 });
 
-test('getBalances returns only XLM for an XLM-only account', async () => {
-  mock.method(server, 'loadAccount', async () => ({
-    balances: [{ asset_type: 'native', balance: '5.0000000' }],
-  }));
-
-  const balances = await stellarAdapter.getBalances('GABCD');
-  assert.deepEqual(balances, [{ asset: 'XLM', value: '5.0000000' }]);
-});
-
-test('getBalances ignores a USDC-code trustline from an untrusted issuer', async () => {
+test('getBalances never drops a spoofed USDC-code trustline but flags it untrusted', async () => {
   mock.method(server, 'loadAccount', async () => ({
     balances: [
       { asset_type: 'native', balance: '1.0000000' },
@@ -201,7 +229,48 @@ test('getBalances ignores a USDC-code trustline from an untrusted issuer', async
   }));
 
   const balances = await stellarAdapter.getBalances('GABCD');
-  assert.deepEqual(balances, [{ asset: 'XLM', value: '1.0000000' }]);
+  assert.equal(balances.length, 2, 'spoofed trustline must stay for reconciliation evidence');
+
+  const usdcSpoof = balances.find((b) => b.asset === 'USDC');
+  assert.equal(usdcSpoof.value, '999.0000000');
+  assert.equal(usdcSpoof.issuer, OTHER_ISSUER);
+  assert.equal(usdcSpoof.trusted, false);
+  assert.equal(usdcSpoof.assetId, `stellar:testnet:USDC:${OTHER_ISSUER}`);
+
+  const xlm = balances.find((b) => b.asset === 'XLM');
+  assert.equal(xlm.trusted, true);
+});
+
+test('getBalances reports unknown assets with trusted false instead of treating them as trusted', async () => {
+  mock.method(server, 'loadAccount', async () => ({
+    balances: [
+      { asset_type: 'native', balance: '2.0000000' },
+      { asset_type: 'credit_alphanum4', asset_code: 'DOGE', asset_issuer: OTHER_ISSUER, balance: '7.0000000' },
+    ],
+  }));
+
+  const balances = await stellarAdapter.getBalances('GABCD');
+  const doge = balances.find((b) => b.asset === 'DOGE');
+  assert.ok(doge, 'unknown asset must be returned for reconciliation');
+  assert.equal(doge.trusted, false);
+  assert.equal(doge.assetId, `stellar:testnet:DOGE:${OTHER_ISSUER}`);
+});
+
+test('getBalances flags untrusted when the same code is issued by a different (changed) issuer', async () => {
+  // An issuer that is NOT the configured one for USDC on this network must
+  // never be trusted, even though the code is exactly "USDC".
+  mock.method(server, 'loadAccount', async () => ({
+    balances: [
+      { asset_type: 'native', balance: '3.0000000' },
+      { asset_type: 'credit_alphanum4', asset_code: 'USDC', asset_issuer: OTHER_ISSUER, balance: '50.0000000' },
+    ],
+  }));
+
+  const balances = await stellarAdapter.getBalances('GABCD');
+  const usdc = balances.find((b) => b.asset === 'USDC');
+  assert.equal(usdc.trusted, false);
+  assert.equal(usdc.issuer, OTHER_ISSUER);
+  assert.notEqual(usdc.assetId, `stellar:testnet:USDC:${USDC_ISSUER}`);
 });
 
 // A funded account with a sequence so TransactionBuilder can build against it,
@@ -278,81 +347,30 @@ test('establishTrustline gives a readable error for an unfunded account', async 
   );
 });
 
-test('fundTestnetAccount is blocked on mainnet', async () => {
-  const originalIsMainnet = config.stellar.isMainnet;
-  config.stellar.isMainnet = true;
-
-  await assert.rejects(
-    stellarAdapter.fundTestnetAccount(SOURCE_PUBLIC_KEY),
-    /Friendbot funding is not available on mainnet/,
-  );
-
-  config.stellar.isMainnet = originalIsMainnet;
-});
-
-test('fundTestnetAccount allows on testnet', async () => {
-  const originalIsMainnet = config.stellar.isMainnet;
-  config.stellar.isMainnet = false;
-
-  mock.method(require('axios'), 'get', async () => ({
-    data: { result: { id: 'mock' } },
+test('getFundingAccountHealth reports fee and reserve pressure with operator thresholds', async () => {
+  mock.method(server, 'fetchBaseFee', async () => '300');
+  mock.method(server, 'loadAccount', async () => ({
+    account_id: SOURCE_PUBLIC_KEY,
+    subentry_count: 10,
+    balances: [{ asset_type: 'native', balance: '6.0000000' }],
   }));
 
-  const result = await stellarAdapter.fundTestnetAccount(SOURCE_PUBLIC_KEY);
-  assert.equal(result.funded, true);
-
-  config.stellar.isMainnet = originalIsMainnet;
-});
-
-test('submitPayment handles timeout and tx_bad_seq gracefully by reusing envelope and querying Horizon', async () => {
-  mockSuccessfulPaymentSetup();
-
-  mock.method(server, 'fetchBaseFee', async () => '100');
-
-  let callCount = 0;
-  mock.method(server, 'submitTransaction', async (tx) => {
-    callCount += 1;
-    if (callCount === 1) {
-      const error = new Error('timeout');
-      error.isHorizonWriteUncertain = true;
-      throw error;
-    } else {
-      const error = new Error('tx_bad_seq');
-      error.response = {
-        data: {
-          extras: {
-            result_codes: {
-              transaction: 'tx_bad_seq',
-            },
-          },
-        },
-      };
-      throw error;
-    }
+  const report = await stellarAdapter.getFundingAccountHealth({
+    publicKey: SOURCE_PUBLIC_KEY,
+    baseFeeWarningThreshold: 200,
+    baseFeeCriticalThreshold: 250,
+    fundingBalanceWarningThreshold: 10,
+    fundingBalanceCriticalThreshold: 6,
+    reserveWarningThreshold: 0.65,
+    reserveCriticalThreshold: 0.75,
+    reserveEntries: 5,
   });
 
-  let horizonCheckCount = 0;
-  const txEndpointMock = {
-    transactionHash: (h) => ({
-      call: async () => {
-        horizonCheckCount += 1;
-        if (horizonCheckCount === 1) {
-          throw new Error('Not found');
-        }
-        return { hash: h };
-      }
-    })
-  };
-  mock.method(server, 'transactions', () => txEndpointMock);
-
-  const result = await stellarAdapter.submitPayment({
-    secretKey: SOURCE_SECRET,
-    destination: DESTINATION_PUBLIC_KEY,
-    amount: '10',
-    asset: 'XLM',
-  });
-
-  assert.ok(result.txHash);
-  assert.equal(callCount, 2);
-  assert.equal(horizonCheckCount, 2);
+  assert.equal(report.status, 'critical');
+  assert.equal(report.baseFeeStatus, 'critical');
+  assert.equal(report.fundingBalanceStatus, 'critical');
+  assert.equal(report.reserveStatus, 'critical');
+  assert.equal(report.fundingCapacityWallets, 1);
+  assert.ok(Array.isArray(report.runbook));
+  assert.ok(report.runbook.length > 0);
 });

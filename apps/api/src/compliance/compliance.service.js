@@ -2,17 +2,123 @@ const config = require('../config/env');
 const prisma = require('../common/prisma');
 const logger = require('../utils/logger');
 const smileId = require('./smileId.provider');
-const { assertValidAmount, add, compare, formatUnits, getAssetRule } = require('../utils/money');
+const { assertValidAmount, add, compare, formatUnits, getAssetRule, parseUnits } = require('../utils/money');
+const { getPolicyConversionSnapshot, PolicyError, POLICY_ERROR_CODES } = require('../pricing/policyRate');
 
-const tierLimits = {
-  0: { daily: 0, single: 0 },
-  1: { daily: process.env.TIER_1_DAILY_LIMIT || '50000.00', single: process.env.TIER_1_SINGLE_LIMIT || '20000.00' },
-  2: { daily: process.env.TIER_2_DAILY_LIMIT || '500000.00', single: process.env.TIER_2_SINGLE_LIMIT || '200000.00' },
-  3: { daily: process.env.TIER_3_DAILY_LIMIT || '5000000.00', single: process.env.TIER_3_SINGLE_LIMIT || '1000000.00' },
+const defaultTierLimits = {
+  0: { daily: '0.00', single: '0.00' },
+  1: { daily: '50000.00', single: '20000.00' },
+  2: { daily: '500000.00', single: '200000.00' },
+  3: { daily: '5000000.00', single: '1000000.00' },
 };
 
+const policyCurrency = () => String(config.compliance?.policyCurrency || 'NGN').trim().toUpperCase();
+
+const canonicalizePolicyAmount = (value, currency) => {
+  const rule = getAssetRule(currency);
+  return formatUnits(parseUnits(String(value), rule.precision, { rejectExcessPrecision: false }), rule.precision);
+};
+
+const tierLimitsFor = (tier) => {
+  const configured = config.compliance?.tierLimits || defaultTierLimits;
+  const limits = configured[tier] || configured[0] || defaultTierLimits[0];
+  const currency = policyCurrency();
+  return {
+    daily: canonicalizePolicyAmount(limits.daily, currency),
+    single: canonicalizePolicyAmount(limits.single, currency),
+  };
+};
+
+const throwDailyIncomplete = () => {
+  throw new PolicyError(
+    POLICY_ERROR_CODES.DAILY_TOTAL_INCOMPLETE,
+    'Recent payments are missing a reference-currency amount; this payment cannot be evaluated against daily limits.',
+  );
+};
+
+const storedReferenceAmount = (transaction, currency) => {
+  if (!transaction || String(transaction.fiatCurrency || '').trim().toUpperCase() !== currency) {
+    throwDailyIncomplete();
+  }
+  try {
+    return canonicalizePolicyAmount(transaction.fiatAmount, currency);
+  } catch (_error) {
+    throwDailyIncomplete();
+  }
+};
+
+// Legacy country sets (deprecated — retained for fail-safe fallback only)
 const SANCTIONS_BLOCKED_COUNTRIES = new Set(['KP', 'IR', 'SY', 'CU', 'SD', 'SDN']);
 const SANCTIONS_REVIEW_COUNTRIES = new Set(['RU', 'BY', 'CN', 'VE', 'PK']);
+
+// Screening provider interface — implementations must match this contract
+const createScreeningProvider = () => {
+  const providerName = config.compliance?.screeningProvider || 'static';
+  
+  if (providerName === 'static') {
+    // Static fallback provider — uses legacy country sets
+    // DEPRECATED: Only for development/test or emergency fallback
+    return {
+      name: 'static',
+      version: 'legacy-country-codes',
+      screen: async ({ subjects }) => {
+        const results = [];
+        for (const subject of subjects) {
+          const country = String(subject.country || '').trim().toUpperCase();
+          let status = 'cleared';
+          let reason = 'Static screening passed (legacy country codes).';
+          
+          if (SANCTIONS_BLOCKED_COUNTRIES.has(country)) {
+            status = 'blocked';
+            reason = `Country ${country} is on the static blocked list.`;
+          } else if (SANCTIONS_REVIEW_COUNTRIES.has(country)) {
+            status = 'review';
+            reason = `Country ${country} is on the static review list.`;
+          }
+          
+          results.push({
+            subjectId: subject.id,
+            subjectType: subject.type,
+            status,
+            reason,
+            matches: [],
+            provider: 'static',
+            listVersion: 'legacy-country-codes',
+          });
+        }
+        return { results, provider: 'static', listVersion: 'legacy-country-codes' };
+      },
+    };
+  }
+  
+  // Placeholder for external provider integration (e.g., ComplyAdvantage, Refinitiv, Dow Jones)
+  // When a real provider is configured, implement the screen() method to call their API
+  // and normalize results to the internal format below.
+  return {
+    name: providerName,
+    version: 'unknown',
+    screen: async () => {
+      throw new Error(`Screening provider "${providerName}" not implemented. Set COMPLIANCE_SCREENING_PROVIDER=static for legacy fallback.`);
+    },
+  };
+};
+
+const screeningProvider = createScreeningProvider();
+
+// Screening result statuses
+const SCREENING_STATUS = Object.freeze({
+  CLEARED: 'cleared',
+  REVIEW: 'review',
+  BLOCKED: 'blocked',
+  ERROR: 'error',
+});
+
+// Subject types for screening
+const SUBJECT_TYPE = Object.freeze({
+  CUSTOMER: 'customer',
+  BENEFICIAL_OWNER: 'beneficial_owner',
+  RECIPIENT: 'recipient',
+});
 
 const getOrCreateKycProfile = async (user) => {
   let profile = await prisma.kycProfile.findUnique({ where: { userId: user.id } });
@@ -101,11 +207,28 @@ const startKycVerification = async ({ user, applicant }) => {
   return prisma.kycProfile.findUnique({ where: { id: profile.id } });
 };
 
+const {
+  KYC_STATUSES,
+  SANCTIONS_STATUSES,
+  CUSTODY_STATUSES,
+  RISK_THRESHOLDS,
+  classifyRiskScore,
+  evaluateKycDecision,
+  getActivityLimits,
+  syncKycAndRiskState,
+  enforceWalletActivityLimit,
+} = require('./kycDecision.service');
+
 const callbackDecision = (resultCode) => {
-  if (['1020', '1021'].includes(String(resultCode))) return { status: 'approved', tier: 1, deniedReason: null };
-  if (String(resultCode) === '1022') return { status: 'rejected', tier: 0, deniedReason: 'Identity details did not match' };
-  return { status: 'review', tier: 0, deniedReason: 'Provider result requires manual review' };
+  const decision = evaluateKycDecision({ providerResultCode: resultCode });
+  return {
+    status: decision.status,
+    tier: decision.tier,
+    deniedReason: decision.reason,
+  };
 };
+
+const cryptoHash = (value) => require('crypto').createHash('sha256').update(value).digest('hex');
 
 const processSmileIdCallback = async (payload) => {
   if (!smileId.verifyCallback({ signature: payload.signature, timestamp: payload.timestamp })) {
@@ -144,33 +267,26 @@ const processSmileIdCallback = async (payload) => {
           resultCode: String(payload.ResultCode),
         },
       });
-      const updated = await tx.kycProfile.update({
-        where: { id: profile.id },
-        data: {
-          ...decision,
-          riskScore: decision.status === 'approved' ? profile.riskScore : Math.max(profile.riskScore, 50),
-          metadata: {
-            resultCode: String(payload.ResultCode),
-            resultText: String(payload.ResultText || ''),
-            smileJobId: String(payload.SmileJobID || ''),
-            verifiedAt: new Date().toISOString(),
-          },
+
+      const nextRiskScore = decision.status === KYC_STATUSES.APPROVED ? profile.riskScore : Math.max(profile.riskScore, 50);
+
+      const updated = await syncKycAndRiskState({
+        userId: profile.userId,
+        tier: decision.tier,
+        status: decision.status,
+        riskScore: nextRiskScore,
+        deniedReason: decision.deniedReason,
+        metadata: {
+          resultCode: String(payload.ResultCode),
+          resultText: String(payload.ResultText || ''),
+          smileJobId: String(payload.SmileJobID || ''),
+          verifiedAt: new Date().toISOString(),
         },
+        actorType: 'provider',
+        actorId: 'smileid',
+        tx,
       });
-      await tx.user.update({
-        where: { id: profile.userId },
-        data: { kycTier: updated.tier, riskScore: updated.riskScore },
-      });
-      await tx.auditLog.create({
-        data: {
-          actorType: 'provider',
-          actorId: 'smileid',
-          action: 'kyc.callback.processed',
-          entityType: 'KycProfile',
-          entityId: profile.id,
-          metadata: { resultCode: String(payload.ResultCode), status: updated.status },
-        },
-      });
+
       return updated;
     });
     logger.info('kyc_callback_processed', { profileId: result.id, status: result.status, resultCode: String(payload.ResultCode) });
@@ -184,51 +300,236 @@ const processSmileIdCallback = async (payload) => {
   }
 };
 
-const cryptoHash = (value) => require('crypto').createHash('sha256').update(value).digest('hex');
-
-const calculateRiskScore = ({ amount, asset = 'NGN', routeType, destinationCountry, profileRiskScore = 0 }) => {
+const calculateRiskScore = ({ amount, asset, routeType, destinationCountry, profileRiskScore = 0 }) => {
+  const riskAsset = asset || policyCurrency();
+  const normalizedAmount = canonicalizePolicyAmount(amount, riskAsset);
   let score = 10;
-  if (compare(assertValidAmount(amount, asset), '100000.00', asset) > 0) score += 30;
-  if (compare(assertValidAmount(amount, asset), '50000.00', asset) > 0) score += 10;
+  if (compare(normalizedAmount, canonicalizePolicyAmount('100000.00', riskAsset), riskAsset) > 0) score += 30;
+  if (compare(normalizedAmount, canonicalizePolicyAmount('50000.00', riskAsset), riskAsset) > 0) score += 10;
   if (routeType === 'cross_border') score += 25;
   if (destinationCountry && destinationCountry !== 'NG') score += 15;
   score += Math.min(Math.max(Number(profileRiskScore) || 0, 0), 30);
   return Math.min(score, 100);
 };
 
-const normalizeCountry = (country) => String(country || '').trim().toUpperCase();
+// Build screening subjects for a transaction
+const buildScreeningSubjects = ({ user, destinationCountry, recipientPhoneNumber, destination }) => {
+  const subjects = [];
 
-const screenSanctions = ({ destinationCountry, routeType }) => {
-  const country = normalizeCountry(destinationCountry);
-  if (country && SANCTIONS_BLOCKED_COUNTRIES.has(country)) {
-    return {
-      status: 'blocked',
-      reason: 'Destination country is subject to sanctions screening and cannot be served.',
-    };
+  // Customer (sender)
+  subjects.push({
+    id: `customer:${user.id}`,
+    type: SUBJECT_TYPE.CUSTOMER,
+    name: `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.phoneNumber,
+    country: user.country || 'NG',
+    identifiers: {
+      phoneNumber: user.phoneNumber,
+      userId: String(user.id),
+    },
+  });
+
+  // Recipient (if phone number provided)
+  if (recipientPhoneNumber) {
+    subjects.push({
+      id: `recipient:${recipientPhoneNumber}`,
+      type: SUBJECT_TYPE.RECIPIENT,
+      phoneNumber: recipientPhoneNumber,
+      country: destinationCountry || 'NG',
+      identifiers: {
+        phoneNumber: recipientPhoneNumber,
+      },
+    });
   }
-  if (country && SANCTIONS_REVIEW_COUNTRIES.has(country)) {
-    return {
-      status: 'review',
-      reason: 'Destination country is high-risk and requires manual sanctions review.',
-    };
+
+  // Destination address (if Stellar address provided)
+  if (destination) {
+    subjects.push({
+      id: `destination:${destination}`,
+      type: SUBJECT_TYPE.RECIPIENT,
+      address: destination,
+      country: destinationCountry || 'NG',
+      identifiers: {
+        stellarAddress: destination,
+      },
+    });
   }
-  if (routeType === 'cross_border') {
-    return {
-      status: 'review',
-      reason: 'Cross-border transfers require manual sanctions review before settlement.',
-    };
+
+  // Destination country (for country-based screening when no specific recipient)
+  if (destinationCountry && !recipientPhoneNumber && !destination) {
+    subjects.push({
+      id: `destination-country:${destinationCountry}`,
+      type: SUBJECT_TYPE.RECIPIENT,
+      country: destinationCountry,
+      identifiers: {
+        destinationCountry,
+      },
+    });
   }
-  return {
-    status: 'cleared',
-    reason: 'Local screening passed.',
-  };
+
+  return subjects;
 };
 
-const enforceTransactionPolicy = async ({ user, amount, asset = 'NGN', routeType, destinationCountry, tx = prisma }) => {
+// Persist screening results with full audit trail
+const persistScreeningResults = async ({ profileId, subjects: _subjects, results, tx }) => {
+  const now = new Date();
+
+  for (const result of results) {
+    await tx.sanctionsScreeningResult.create({
+      data: {
+        profileId,
+        subjectId: result.subjectId,
+        subjectType: result.subjectType,
+        provider: result.provider,
+        listVersion: result.listVersion,
+        status: result.status,
+        reason: result.reason,
+        matches: result.matches || [],
+        screenedAt: now,
+        decisionOwner: result.status === SCREENING_STATUS.REVIEW ? 'system' : null,
+      },
+    });
+  }
+
+  const hasBlocked = results.some((r) => r.status === SCREENING_STATUS.BLOCKED);
+  const hasReview = results.some((r) => r.status === SCREENING_STATUS.REVIEW);
+
+  let overallStatus = SCREENING_STATUS.CLEARED;
+  if (hasBlocked) overallStatus = SCREENING_STATUS.BLOCKED;
+  else if (hasReview) overallStatus = SCREENING_STATUS.REVIEW;
+
+  await tx.kycProfile.update({
+    where: { id: profileId },
+    data: {
+      sanctionsStatus: overallStatus,
+      sanctionsScreenedAt: now,
+      lastScreenedAt: now,
+    },
+  });
+
+  return overallStatus;
+};
+
+// Main screening function using configured provider
+const screenSanctions = async ({ user, destinationCountry, routeType: _routeType, recipientPhoneNumber, destination, tx = prisma }) => {
   const profile = await getOrCreateKycProfile(user);
-  const limits = tierLimits[profile.tier] || tierLimits[0];
-  const policyAsset = asset;
-  const normalizedAmount = assertValidAmount(amount, policyAsset);
+  const maxAgeMs = Number(config.compliance?.screeningMaxAgeMs || 24 * 60 * 60 * 1000);
+
+  if (
+    profile.sanctionsScreenedAt &&
+    Date.now() - new Date(profile.sanctionsScreenedAt).getTime() < maxAgeMs &&
+    profile.sanctionsStatus !== SCREENING_STATUS.REVIEW &&
+    profile.sanctionsStatus !== SCREENING_STATUS.BLOCKED
+  ) {
+    return {
+      status: profile.sanctionsStatus,
+      reason: 'Previously cleared by compliance (cached).',
+      cached: true,
+    };
+  }
+
+  const subjects = buildScreeningSubjects({ user, destinationCountry, recipientPhoneNumber, destination });
+
+  try {
+    const screeningResult = await screeningProvider.screen({ subjects });
+
+    const overallStatus = await persistScreeningResults({
+      profileId: profile.id,
+      subjects,
+      results: screeningResult.results,
+      tx,
+    });
+
+    await tx.auditLog.create({
+      data: {
+        actorType: 'system',
+        actorId: 'screening',
+        action: 'sanctions.screening.completed',
+        entityType: 'KycProfile',
+        entityId: profile.id,
+        metadata: {
+          provider: screeningResult.provider,
+          listVersion: screeningResult.listVersion,
+          subjects: subjects.map((s) => ({ id: s.id, type: s.type })),
+          results: screeningResult.results.map((r) => ({
+            subjectId: r.subjectId,
+            status: r.status,
+            reason: r.reason,
+          })),
+          overallStatus,
+        },
+      },
+    });
+
+    return {
+      status: overallStatus,
+      reason: screeningResult.results.find((r) => r.status !== SCREENING_STATUS.CLEARED)?.reason || 'Screening passed.',
+      cached: false,
+      details: screeningResult.results,
+    };
+  } catch (error) {
+    logger.error('sanctions_screening_failed', {
+      profileId: profile.id,
+      provider: screeningProvider.name,
+      error: error.message,
+    });
+
+    if (profile.sanctionsStatus === SCREENING_STATUS.CLEARED && profile.sanctionsScreenedAt) {
+      const staleness = Date.now() - new Date(profile.sanctionsScreenedAt).getTime();
+      const maxStaleness = Number(config.compliance?.screeningMaxStalenessMs || 72 * 60 * 60 * 1000);
+
+      if (staleness < maxStaleness) {
+        logger.warn('sanctions_screening_unavailable_using_stale_cleared', {
+          profileId: profile.id,
+          stalenessMs: staleness,
+        });
+        return {
+          status: SCREENING_STATUS.CLEARED,
+          reason: 'Screening temporarily unavailable; using previously cleared result.',
+          cached: true,
+          stale: true,
+        };
+      }
+    }
+
+    logger.warn('sanctions_screening_unavailable_fail_safe_review', {
+      profileId: profile.id,
+      provider: screeningProvider.name,
+    });
+
+    return {
+      status: SCREENING_STATUS.REVIEW,
+      reason: 'Sanctions screening temporarily unavailable; manual review required.',
+      cached: false,
+      error: true,
+    };
+  }
+};
+
+const enforceTransactionPolicy = async ({
+  user,
+  amount,
+  asset = 'NGN',
+  routeType,
+  destinationCountry,
+  recipientPhoneNumber,
+  destination,
+  tx = prisma,
+  now,
+  fetchFiatRate,
+  fetchCryptoUsdRate,
+}) => {
+  const profile = await getOrCreateKycProfile(user);
+  const limits = tierLimitsFor(profile.tier);
+  const referenceCurrency = policyCurrency();
+  const settlementAsset = String(asset || referenceCurrency).trim().toUpperCase();
+  assertValidAmount(amount, settlementAsset);
+
+  if (user?.deactivatedAt) {
+    throw Object.assign(
+      new Error('This account is deactivated. Contact support to restore access.'),
+      { statusCode: 403, code: 'ACCOUNT_DEACTIVATED' },
+    );
+  }
 
   if (profile.status !== 'approved') {
     throw new Error('KYC approval is required before sending money.');
@@ -246,52 +547,68 @@ const enforceTransactionPolicy = async ({ user, amount, asset = 'NGN', routeType
     throw new Error('This account is under sanctions review and cannot send funds until cleared.');
   }
 
-  if (compare(normalizedAmount, limits.single, policyAsset) > 0) {
+  const policySnapshot = await getPolicyConversionSnapshot({
+    sourceAsset: settlementAsset,
+    amount,
+    now,
+    ...(fetchFiatRate ? { fetchFiatRate } : {}),
+    ...(fetchCryptoUsdRate ? { fetchCryptoUsdRate } : {}),
+  });
+  const convertedAmount = policySnapshot.convertedAmount;
+
+  if (compare(convertedAmount, limits.single, referenceCurrency) > 0) {
     throw new Error(`This payment exceeds your tier ${profile.tier} single transaction limit.`);
   }
 
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const since = new Date((now instanceof Date ? now.getTime() : Date.now()) - 24 * 60 * 60 * 1000);
   const recent = await tx.transaction.findMany({
     where: {
       userId: user.id,
-      asset: policyAsset,
+      type: 'send',
       status: { in: ['success', 'processing', 'pending'] },
       createdAt: { gte: since },
     },
-    select: { amount: true, asset: true },
+    select: { amount: true, asset: true, fiatAmount: true, fiatCurrency: true },
   });
-  const zeroAmount = formatUnits(0n, getAssetRule(policyAsset).precision);
-  const dailyTotal = recent.reduce((sum, t) => add(sum, t.amount || zeroAmount, policyAsset), zeroAmount);
-  if (compare(add(dailyTotal, normalizedAmount, policyAsset), limits.daily, policyAsset) > 0) {
+  const zeroAmount = formatUnits(0n, getAssetRule(referenceCurrency).precision);
+  const dailyTotal = recent.reduce(
+    (sum, t) => add(sum, storedReferenceAmount(t, referenceCurrency), referenceCurrency),
+    zeroAmount,
+  );
+  if (compare(add(dailyTotal, convertedAmount, referenceCurrency), limits.daily, referenceCurrency) > 0) {
     throw new Error(`This payment exceeds your tier ${profile.tier} daily limit.`);
   }
 
-  const sanctionsResult = profile.sanctionsStatus === 'cleared'
-    ? { status: 'cleared', reason: 'Previously cleared by compliance.' }
-    : screenSanctions({ destinationCountry, routeType });
-
-  const updatedProfile = await prisma.kycProfile.update({
-    where: { id: profile.id },
-    data: {
-      sanctionsStatus: sanctionsResult.status,
-      sanctionsScreenedAt: new Date(),
-      lastScreenedAt: new Date(),
-    },
+  // Use provider-based screening with full audit trail
+  const sanctionsResult = await screenSanctions({
+    user,
+    destinationCountry,
+    routeType,
+    recipientPhoneNumber,
+    destination,
+    tx,
   });
 
-  if (sanctionsResult.status === 'blocked') {
+  if (sanctionsResult.status === SCREENING_STATUS.BLOCKED) {
     throw new Error(sanctionsResult.reason);
   }
-  if (sanctionsResult.status === 'review') {
+  if (sanctionsResult.status === SCREENING_STATUS.REVIEW) {
     throw new Error(`This payment requires manual compliance review: ${sanctionsResult.reason}`);
   }
 
-  const riskScore = calculateRiskScore({ amount: normalizedAmount, asset: policyAsset, routeType, destinationCountry, profileRiskScore: updatedProfile.riskScore });
-  if (riskScore >= 80) {
+  const riskScore = calculateRiskScore({
+    amount: convertedAmount,
+    asset: referenceCurrency,
+    routeType,
+    destinationCountry,
+    profileRiskScore: profile.riskScore,
+  });
+
+  if (riskScore >= RISK_THRESHOLDS.CRITICAL_MIN) {
     throw new Error('This payment requires manual compliance review.');
   }
 
-  return { profile: updatedProfile, riskScore };
+  return { profile, riskScore, policySnapshot, limits };
 };
 
 module.exports = {
@@ -301,4 +618,15 @@ module.exports = {
   startKycVerification,
   processSmileIdCallback,
   callbackDecision,
+  KYC_STATUSES,
+  SANCTIONS_STATUSES,
+  CUSTODY_STATUSES,
+  RISK_THRESHOLDS,
+  classifyRiskScore,
+  evaluateKycDecision,
+  getActivityLimits,
+  syncKycAndRiskState,
+  enforceWalletActivityLimit,
+  PolicyError,
+  POLICY_ERROR_CODES,
 };

@@ -19,7 +19,13 @@ injectMock('wallet/stellar.adapter', () => ({
   getTransactionUrl: (hash) => `https://stellar.expert/explorer/testnet/tx/${hash}`,
 }));
 
-const { reconcileStaleTransactions } = require('../src/payment/payment.reconciler');
+const {
+  reconcileStaleTransactions,
+  listLedgerDiscrepancies,
+  listStuckPayments,
+  operatorResolveStuckPayment,
+} = require('../src/payment/payment.reconciler');
+
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -70,11 +76,30 @@ const makeHorizon = ({ txResult, payments = [] } = {}) => ({
 
 const makePrisma = (txList) => {
   const updated = [];
+  const map = new Map(txList.map((t) => [t.id, { ...t }]));
   return {
     _updated: updated,
     transaction: {
-      findMany: async () => txList,
-      update: async (args) => { updated.push(args); return { ...args.where, ...args.data }; },
+      findMany: async () => Array.from(map.values()),
+      findUnique: async ({ where }) => map.get(where.id) || null,
+      update: async (args) => {
+        updated.push(args);
+        const cur = map.get(args.where.id) || {};
+        const res = { ...cur, ...args.data };
+        map.set(args.where.id, res);
+        return res;
+      },
+      updateMany: async (args) => {
+        updated.push(args);
+        const item = map.get(args.where.id);
+        if (item) {
+          Object.assign(item, args.data, {
+            metadata: { ...(item.metadata || {}), ...(args.data.metadata || {}) },
+          });
+          return { count: 1 };
+        }
+        return { count: 0 };
+      },
     },
   };
 };
@@ -118,14 +143,6 @@ test('reconcileStaleTransactions: txHash on ledger but successful=false → fail
 // Transient 404: window still open → no update, retry next cycle
 // ---------------------------------------------------------------------------
 test('reconcileStaleTransactions: Horizon 404 while ledger sequence window is open → no status change (retry)', async () => {
-  // Transaction is 6 min old: past staleAgeMs(5m) but inside LEDGER_SEQUENCE_WINDOW_MS(5m)?
-  // Actually 6 min > 5 min, so sequence window IS closed for the default.
-  // Use a transaction only 5.5 min old to stay within the window.
-  const tx = recentPendingTx({
-    id: 'tx_fresh',
-    createdAt: new Date(Date.now() - 5.5 * 60 * 1000), // 5.5 min > staleAgeMs but < window
-  });
-  // Override staleAgeMs to 5min but window is 5min — need tx inside the window.
   // Use a 2-min-old tx with staleAgeMs=1min so it's stale but window still open.
   const freshTx = recentPendingTx({
     id: 'tx_fresh2',
@@ -233,4 +250,100 @@ test('reconcileStaleTransactions: no stale transactions returns zero counts', as
 
   assert.equal(result.processedCount, 0);
   assert.equal(result.updatedCount, 0);
+});
+
+test('listLedgerDiscrepancies detects unbalanced journal entries', async () => {
+  const report = await listLedgerDiscrepancies({
+    prisma: {
+      journalEntry: {
+        findMany: async () => [
+          {
+            id: 'entry_bad',
+            eventType: 'payment.reserved',
+            transactionId: 'tx_bad',
+            postings: [
+              { asset: 'XLM', amount: '-10.0000000' },
+              { asset: 'XLM', amount: '9.0000000' },
+            ],
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(report.checkedCount, 1);
+  assert.equal(report.discrepancyCount, 1);
+  assert.equal(report.discrepancies[0].type, 'unbalanced_entry');
+});
+
+test('listStuckPayments returns ledger evidence and retry history', async () => {
+  const result = await listStuckPayments({
+    prisma: {
+      transaction: {
+        findMany: async () => [
+          {
+            id: 'tx_stuck',
+            status: 'processing',
+            createdAt: new Date(Date.now() - 60 * 60 * 1000),
+            metadata: { retryHistory: [{ action: 'retry' }] },
+            ledgerEntries: [{ id: 'entry_1', postings: [] }],
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0].retryHistory.length, 1);
+  assert.equal(result[0].ledgerEvidence.length, 1);
+});
+
+test('operatorResolveStuckPayment requires reason and records retry action without settling twice', async () => {
+  await assert.rejects(() => operatorResolveStuckPayment({
+    prisma: {},
+    transactionId: 'tx_stuck',
+    action: 'retry',
+    reason: '',
+    adminId: 'admin_1',
+  }), /reason/);
+
+  const updates = [];
+  const stuckTx = { id: 'tx_stuck', status: 'pending', metadata: {} };
+  const prismaMock = {
+    $transaction: async (fn) => fn({
+      transaction: {
+        findUnique: async ({ where }) => (where.id === stuckTx.id ? { ...stuckTx } : null),
+        updateMany: async ({ data }) => {
+          updates.push(data);
+          Object.assign(stuckTx, data);
+          return { count: 1 };
+        },
+      },
+    }),
+  };
+
+  const updated = await operatorResolveStuckPayment({
+    prisma: prismaMock,
+    transactionId: 'tx_stuck',
+    action: 'retry',
+    reason: 'horizon timeout cleared',
+    adminId: 'admin_1',
+  });
+
+  assert.equal(updated.status, 'processing');
+  assert.equal(updates[0].metadata.retryHistory.length, 1);
+
+  await assert.rejects(() => operatorResolveStuckPayment({
+    prisma: {
+      $transaction: async (fn) => fn({
+        transaction: {
+          findUnique: async () => ({ id: 'tx_done', status: 'success', metadata: {} }),
+        },
+      }),
+    },
+    transactionId: 'tx_done',
+    action: 'retry',
+    reason: 'checking duplicate',
+    adminId: 'admin_1',
+  }), /cannot be retried/);
 });

@@ -56,6 +56,8 @@ const fakeAdapter = {
     calls.trustline.push(args);
     return { established: true, alreadyExisted: false };
   },
+  classifyRecoverableError: (error) => ({ code: 'unknown', retryable: false, userMessage: String(error?.message || error || 'Unknown error') }),
+  classifyTrustlineError: (error) => ({ code: 'unknown', retryable: false, userMessage: String(error?.message || error || 'Unknown error') }),
 };
 injectMock('wallet/stellar.adapter', () => fakeAdapter);
 
@@ -89,6 +91,11 @@ injectMock('common/records', () => ({
   withIdAliases: (xs) => xs,
 }));
 injectMock('utils/validators', () => ({ canonicalizePhoneNumber: (value) => value }));
+injectMock('compliance/account.service', () => ({ assertAccountActive: () => {} }));
+injectMock('common/event.service', () => ({
+  appendEvent: async () => {},
+  EVENT_TYPES: { WALLET_CREATED: 'wallet.created' },
+}));
 
 // Now load the SUT.
 const walletService = require('../src/wallet/wallet.service');

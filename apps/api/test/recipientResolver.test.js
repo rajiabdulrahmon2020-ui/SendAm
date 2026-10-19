@@ -17,9 +17,8 @@ const prismaWithAliases = (aliases) => ({
   },
 });
 
-// Factory: pass a map of already-existing wallets keyed by phone number; any
-// other number falls through to a freshly created wallet.
-const walletServiceMock = (wallets = {}) => ({
+const wallets = {};
+const walletServiceMock = () => ({
   createOrGetWallet: async ({ phoneNumber }) => {
     if (wallets[phoneNumber]) return wallets[phoneNumber];
     if (phoneNumber === VALID_PHONE_2) {
